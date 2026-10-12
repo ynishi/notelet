@@ -86,6 +86,21 @@ url = "https://<host>/mcp"
 bearer_token_env_var = "NOTELET_TOKEN"
 ```
 
+## Browser view
+
+`serve` also answers a read-only HTML view of the store under `/ui/`, for a person who wants to read notes without an MCP client:
+
+| route (GET) | shows |
+|---|---|
+| `/ui/` | top-level prefixes (`projects/`, `tasks/`, `lists/` and any other that exists) and a search form |
+| `/ui/tree/<prefix>` | one page of `note_list` under the prefix (path, size in bytes, updated_at), the prefixes below it, a `next` link |
+| `/ui/note/<path>` | the note rendered from Markdown, with version, updated_at and size |
+| `/ui/search?q=&prefix=` | `note_search` hits with snippets |
+
+When a token is configured, the browser asks for HTTP Basic credentials: any user name, the token as the password (compared in constant time; a failure is `401` with `WWW-Authenticate: Basic realm="notelet", charset="UTF-8"`). Without a token (loopback binds only) there is no credential, so both `/mcp` and `/ui` accept only a loopback `Host` value (`localhost`, `127.0.0.1` or `[::1]`, any port) and answer `403` otherwise. `/mcp` keeps its bearer check and `/healthz` stays open.
+
+The view is a projection, not part of the model: it calls the same `get` / `list` / `search` the tools do, has no route that writes, and adds no tool. Raw HTML in a note is shown as text, links keep only `http`, `https`, `mailto` or relative URLs, images are shown as links rather than loaded, pages carry no script and no external asset, and every page is sent with `Cache-Control: no-store`.
+
 ## Layout
 
 ```
