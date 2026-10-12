@@ -97,9 +97,9 @@ bearer_token_env_var = "NOTELET_TOKEN"
 | `/ui/note/<path>` | the note rendered from Markdown, with version, updated_at and size |
 | `/ui/search?q=&prefix=` | `note_search` hits with snippets |
 
-When a token is configured, the browser asks for HTTP Basic credentials: any user name, the token as the password (compared in constant time; a failure is `401` with `WWW-Authenticate: Basic realm="notelet"`). Without a token (loopback binds only) the view is open, as `/mcp` is. `/mcp` keeps its bearer check and `/healthz` stays open.
+When a token is configured, the browser asks for HTTP Basic credentials: any user name, the token as the password (compared in constant time; a failure is `401` with `WWW-Authenticate: Basic realm="notelet", charset="UTF-8"`). Without a token (loopback binds only) there is no credential, so both `/mcp` and `/ui` accept only a loopback `Host` value (`localhost`, `127.0.0.1` or `[::1]`, any port) and answer `403` otherwise. `/mcp` keeps its bearer check and `/healthz` stays open.
 
-The view is a projection, not part of the model: it calls the same `get` / `list` / `search` the tools do, has no route that writes, and adds no tool. Raw HTML in a note is shown as text, links keep only `http`, `https`, `mailto` or relative URLs, images are shown as links rather than loaded, and pages carry no script and no external asset.
+The view is a projection, not part of the model: it calls the same `get` / `list` / `search` the tools do, has no route that writes, and adds no tool. Raw HTML in a note is shown as text, links keep only `http`, `https`, `mailto` or relative URLs, images are shown as links rather than loaded, pages carry no script and no external asset, and every page is sent with `Cache-Control: no-store`.
 
 ## Layout
 

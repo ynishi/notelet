@@ -378,6 +378,22 @@ pub async fn run_stdio(svc: Arc<NoteService>, actor: String) -> anyhow::Result<(
 /// ([`crate::ui`]) is merged in under `/ui`, behind HTTP Basic with the same
 /// token.
 pub async fn run_http(svc: Arc<NoteService>, cfg: Config) -> anyhow::Result<()> {
+    let router = build_router(svc, &cfg);
+    let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+    tracing::info!(
+        bind = %cfg.bind,
+        auth = if cfg.token.is_some() { "bearer" } else { "none (loopback)" },
+        "serving notelet MCP at /mcp, read-only view at /ui/"
+    );
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+/// The full HTTP router `run_http` serves: `/healthz` (open), `/mcp`
+/// (bearer when a token is set) and `/ui` (Basic when a token is set,
+/// loopback `Host` only otherwise). Split out so tests can drive it without
+/// binding a socket.
+pub(crate) fn build_router(svc: Arc<NoteService>, cfg: &Config) -> axum::Router {
     let actor = cfg.actor.clone();
     let ui = crate::ui::router(svc.clone(), cfg.token.clone());
     let mut http_config = StreamableHttpServerConfig::default();
@@ -402,19 +418,10 @@ pub async fn run_http(svc: Arc<NoteService>, cfg: Config) -> anyhow::Result<()> 
             },
         ));
     }
-    let router = axum::Router::new()
+    axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .merge(mcp_router)
-        .merge(ui);
-
-    let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
-    tracing::info!(
-        bind = %cfg.bind,
-        auth = if cfg.token.is_some() { "bearer" } else { "none (loopback)" },
-        "serving notelet MCP at /mcp, read-only view at /ui/"
-    );
-    axum::serve(listener, router).await?;
-    Ok(())
+        .merge(ui)
 }
 
 #[cfg(test)]
@@ -611,5 +618,71 @@ mod tests {
             assert!(names.contains(&n.to_string()), "{n} missing from {names:?}");
         }
         assert_eq!(names.len(), 8);
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use notelet_core::MemoryNoteRepo;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "secret";
+    // base64("anyone:secret")
+    const BASIC_GOOD: &str = "Basic YW55b25lOnNlY3JldA==";
+
+    fn app() -> axum::Router {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        let cfg = Config {
+            database_url: String::new(),
+            token: Some(TOKEN.into()),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            actor: "test".into(),
+        };
+        build_router(svc, &cfg)
+    }
+
+    async fn status(method: &str, uri: &str, auth: Option<&str>) -> StatusCode {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "localhost");
+        if let Some(a) = auth {
+            req = req.header(header::AUTHORIZATION, a);
+        }
+        app()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn healthz_needs_no_credentials() {
+        assert_eq!(status("GET", "/healthz", None).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn basic_does_not_satisfy_the_mcp_bearer_check() {
+        assert_eq!(
+            status("POST", "/mcp", Some(BASIC_GOOD)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(status("POST", "/mcp", None).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_does_not_satisfy_the_ui_basic_check() {
+        let bearer = format!("Bearer {TOKEN}");
+        assert_eq!(
+            status("GET", "/ui/", Some(&bearer)).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status("GET", "/ui/", Some(BASIC_GOOD)).await,
+            StatusCode::OK
+        );
     }
 }

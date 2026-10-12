@@ -13,11 +13,15 @@
 //!
 //! Access: when a token is configured, every `/ui` request needs HTTP Basic
 //! with that token as the password (any user name); otherwise `401` with
-//! `WWW-Authenticate: Basic realm="notelet"`. Without a token (loopback
-//! only, see [`crate::config`]) the view is open, like `/mcp`.
+//! `WWW-Authenticate: Basic realm="notelet", charset="UTF-8"`. Without a
+//! token (loopback binds only, see [`crate::config`]) there is no
+//! credential, so the view accepts only a loopback `Host` (see
+//! [`loopback_host`]) and answers `403` to anything else, the same guard
+//! against DNS rebinding that `/mcp` gets from rmcp's `allowed_hosts`.
 //!
-//! Pages are plain HTML with inline CSS: no script, no external asset, and
-//! a `Content-Security-Policy` that forbids both. The prefixes shown on `/ui/`
+//! Pages are plain HTML with inline CSS: no script, no external asset, a
+//! `Content-Security-Policy` that forbids both, and `Cache-Control:
+//! no-store` so note bodies are not kept in a browser or proxy cache. The prefixes shown on `/ui/`
 //! and above a listing come from a bounded scan of `list` (at most
 //! [`SCAN_PAGES`] pages of 1000 paths); past that the page says the list may
 //! be incomplete.
@@ -53,8 +57,9 @@ struct Ui {
     svc: Arc<NoteService>,
 }
 
-/// The `/ui` routes, with Basic auth in front when `token` is set. Merge it
-/// into the HTTP router; it owns its full paths.
+/// The `/ui` routes, with Basic auth in front when `token` is set and a
+/// loopback-`Host` check in front when it is not. Merge it into the HTTP
+/// router; it owns its full paths.
 pub fn router(svc: Arc<NoteService>, token: Option<String>) -> Router {
     let mut r = Router::new()
         .route("/ui", get(index))
@@ -71,8 +76,56 @@ pub fn router(svc: Arc<NoteService>, token: Option<String>) -> Router {
                 async move { require_basic(token, req, next).await }
             },
         ));
+    } else {
+        r = r.layer(axum::middleware::from_fn(require_loopback_host));
     }
     r
+}
+
+/// Without a token: pass only requests whose `Host` (or, when there is no
+/// `Host` header as with HTTP/2, the request URI's authority) is loopback.
+async fn require_loopback_host(req: Request, next: Next) -> Response {
+    let host = match req.headers().get(header::HOST) {
+        Some(v) => v.to_str().ok(),
+        None => req.uri().authority().map(|a| a.as_str()),
+    };
+    if host.is_some_and(loopback_host) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "forbidden: host not allowed").into_response()
+    }
+}
+
+/// `true` when a `Host` value names this machine: `localhost`, `127.0.0.1`
+/// or `::1` (bare or as `[::1]`), with or without a numeric `:port`.
+/// Matching is case-insensitive, as rmcp's `allowed_hosts` check is (it
+/// lowercases before comparing), so `LOCALHOST:8080` is accepted. Anything
+/// else, including other `127.0.0.0/8` addresses, a malformed port or
+/// trailing junk, is rejected.
+pub(crate) fn loopback_host(value: &str) -> bool {
+    fn port_ok(p: &str) -> bool {
+        !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit())
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        // brackets are only for an IPv6 literal
+        let Some((inner, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let port_fine = after.is_empty() || after.strip_prefix(':').is_some_and(port_ok);
+        return port_fine && inner == "::1";
+    }
+    let host = if value == "::1" {
+        value
+    } else {
+        match value.split_once(':') {
+            None => value,
+            Some((h, p)) if port_ok(p) => h,
+            Some(_) => return false,
+        }
+    };
+    ["localhost", "127.0.0.1", "::1"]
+        .iter()
+        .any(|ok| host.eq_ignore_ascii_case(ok))
 }
 
 async fn require_basic(token: Arc<str>, req: Request, next: Next) -> Response {
@@ -371,6 +424,7 @@ fn page(title: &str, body: &str) -> Response {
                 header::X_CONTENT_TYPE_OPTIONS,
                 HeaderValue::from_static("nosniff"),
             ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
         html,
     )
@@ -401,7 +455,9 @@ mod tests {
     }
 
     async fn call(app: Router, uri: &str, auth: Option<&str>) -> (StatusCode, String, Response) {
-        let mut req = HttpRequest::builder().uri(uri);
+        let mut req = HttpRequest::builder()
+            .uri(uri)
+            .header(header::HOST, "localhost:8490");
         if let Some(a) = auth {
             req = req.header(header::AUTHORIZATION, a);
         }
@@ -485,10 +541,176 @@ mod tests {
         let req = HttpRequest::builder()
             .method("POST")
             .uri("/ui/note/n/a.md")
+            .header(header::HOST, "localhost")
             .body(Body::empty())
             .unwrap();
         let resp = app(None).await.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    async fn with_host(app: Router, host: Option<&str>) -> StatusCode {
+        let mut req = HttpRequest::builder().uri("/ui/");
+        if let Some(h) = host {
+            req = req.header(header::HOST, h);
+        }
+        app.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[test]
+    fn loopback_host_accepts_only_this_machine() {
+        for ok in [
+            "localhost",
+            "localhost:8080",
+            "LOCALHOST",
+            "LocalHost:1",
+            "127.0.0.1",
+            "127.0.0.1:8490",
+            "[::1]",
+            "[::1]:8490",
+            "::1",
+        ] {
+            assert!(loopback_host(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "evil.example",
+            "evil.example:8080",
+            "localhost.example",
+            "example.localhost",
+            "127.0.0.2",
+            "0.0.0.0",
+            "localhost:",
+            "localhost:80x",
+            "localhost:8080:1",
+            "[::1",
+            "[::1]x",
+            "[::1]:",
+            "[::2]:8490",
+            "::1:8490",
+            "[localhost]",
+            "[127.0.0.1]",
+        ] {
+            assert!(!loopback_host(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_token_only_loopback_host_is_served() {
+        assert_eq!(
+            with_host(app(None).await, Some("localhost:8080")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            with_host(app(None).await, Some("[::1]:8490")).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            with_host(app(None).await, Some("evil.example")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            with_host(app(None).await, None).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn with_token_host_is_not_checked() {
+        let req = HttpRequest::builder()
+            .uri("/ui/")
+            .header(header::HOST, "notes.example.com")
+            .header(header::AUTHORIZATION, GOOD)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app(Some("secret")).await.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pages_are_not_cached() {
+        for uri in ["/ui/", "/ui/note/n/a.md", "/ui/note/n/missing.md"] {
+            let (_, _, r) = call(app(None).await, uri, None).await;
+            assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_html_in_a_note_is_shown_escaped() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        svc.put(
+            "n/x.md",
+            "before\n\n<script>alert(1)</script>\n\ninline <script>alert(2)</script> end\n",
+            None,
+            "t",
+        )
+        .await
+        .unwrap();
+        let (s, body, _) = call(router(svc, None), "/ui/note/n/x.md", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
+        assert!(body.contains("&lt;script&gt;alert(2)"), "{body}");
+        assert!(!body.contains("<script"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_snippet_is_escaped() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        svc.put("n/s.md", "if a <b> needle </b> c\n", None, "t")
+            .await
+            .unwrap();
+        let (s, body, _) = call(router(svc, None), "/ui/search?q=needle", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains(r#"href="/ui/note/n/s.md""#), "{body}");
+        assert!(body.contains("&lt;b&gt;"), "{body}");
+        assert!(!body.contains("<b>"), "{body}");
+    }
+
+    /// The `cursor=` value of the `next` link, still percent-encoded, with
+    /// the HTML escaping undone.
+    fn next_href(body: &str) -> Option<String> {
+        let end = body.find(r#"">next</a>"#)?;
+        let start = body[..end].rfind("href=\"")? + "href=\"".len();
+        Some(body[start..end].replace("&amp;", "&"))
+    }
+
+    fn note_links(body: &str) -> Vec<String> {
+        body.split(r#"<a href="/ui/note/"#)
+            .skip(1)
+            .filter_map(|s| s.split('"').next().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tree_next_cursor_returns_the_following_page() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        let total = PAGE as usize + 5;
+        for i in 0..total {
+            svc.put(&format!("p/{i:04}.md"), "x", None, "t")
+                .await
+                .unwrap();
+        }
+        let app = router(svc, None);
+
+        let (s, body, _) = call(app.clone(), "/ui/tree/p/", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let first = note_links(&body);
+        assert_eq!(first.len(), PAGE as usize, "{body}");
+        let next = next_href(&body).expect("first page has a next link");
+        assert!(next.starts_with("/ui/tree/p/?cursor="), "{next}");
+
+        let (s, body, _) = call(app, &next, None).await;
+        assert_eq!(s, StatusCode::OK);
+        let second = note_links(&body);
+        assert_eq!(second.len(), total - PAGE as usize, "{body}");
+        assert!(next_href(&body).is_none(), "{body}");
+
+        let mut all: Vec<String> = first.into_iter().chain(second).collect();
+        let expected: Vec<String> = (0..total).map(|i| format!("p/{i:04}.md")).collect();
+        all.sort();
+        assert_eq!(all, expected);
     }
 
     #[test]
