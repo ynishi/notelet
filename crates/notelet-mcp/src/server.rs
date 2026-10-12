@@ -374,9 +374,12 @@ pub async fn run_stdio(svc: Arc<NoteService>, actor: String) -> anyhow::Result<(
 }
 
 /// Serve over streamable HTTP at `/mcp`, with `/healthz` open, bearer
-/// required on `/mcp` when a token is configured.
+/// required on `/mcp` when a token is configured. The read-only browser view
+/// ([`crate::ui`]) is merged in under `/ui`, behind HTTP Basic with the same
+/// token.
 pub async fn run_http(svc: Arc<NoteService>, cfg: Config) -> anyhow::Result<()> {
     let actor = cfg.actor.clone();
+    let ui = crate::ui::router(svc.clone(), cfg.token.clone());
     let mut http_config = StreamableHttpServerConfig::default();
     http_config.json_response = true;
     if !cfg.bind.ip().is_loopback() {
@@ -401,13 +404,14 @@ pub async fn run_http(svc: Arc<NoteService>, cfg: Config) -> anyhow::Result<()> 
     }
     let router = axum::Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
-        .merge(mcp_router);
+        .merge(mcp_router)
+        .merge(ui);
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(
         bind = %cfg.bind,
         auth = if cfg.token.is_some() { "bearer" } else { "none (loopback)" },
-        "serving notelet MCP at /mcp"
+        "serving notelet MCP at /mcp, read-only view at /ui/"
     );
     axum::serve(listener, router).await?;
     Ok(())

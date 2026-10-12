@@ -1,7 +1,7 @@
 //! `notelet-mcp`: the transport binary. It owns nothing but wiring.
 //!
 //! ```text
-//! notelet-mcp serve     # streamable HTTP MCP at http://<bind>/mcp (default)
+//! notelet-mcp serve     # streamable HTTP MCP at http://<bind>/mcp (default), read-only view at /ui/
 //! notelet-mcp stdio     # the same server over stdin/stdout, for local clients
 //! notelet-mcp migrate   # apply migrations and exit
 //! notelet-mcp import <dir> [--prefix <p>] [--dry-run]   # file tree -> notes (operator)
@@ -16,13 +16,17 @@
 //!
 //! The server itself lives in [`server`]; the bundled guides in
 //! [`resources`]; bearer checking in [`auth`]; the operator's bulk
-//! `import` / `export` (not MCP tools) in [`transfer`].
+//! `import` / `export` (not MCP tools) in [`transfer`]; the read-only
+//! browser view (`/ui`, HTTP Basic, no writes) in [`ui`], rendering through
+//! [`render`].
 
 mod auth;
 mod config;
+mod render;
 mod resources;
 mod server;
 mod transfer;
+mod ui;
 
 use std::sync::Arc;
 

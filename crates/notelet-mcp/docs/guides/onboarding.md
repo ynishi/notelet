@@ -50,6 +50,8 @@ and prints `created / updated / unchanged / skipped / failed` counts.
 
 ## What notelet does not do
 
-It does not render, link, or structure notes. It does not know about users.
+Its tools do not render, link, or structure notes. It does not know about users.
 It does not search with a query language or an index. If you need any of
 those, build them next to notelet on top of `note_dump`, not inside it.
+
+A human can read the store in a browser at `/ui/` on `serve` (read-only, HTTP Basic with the token as the password); it is a projection for people, not a tool, so agents keep using the tools above.
