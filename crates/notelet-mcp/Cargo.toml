@@ -9,7 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme = "../../README.md"
-description = "notelet as an MCP server: a thin hosted Markdown note store (Postgres, bearer auth, optimistic locking) for coding agents"
+description = "Thin hosted Markdown note store for coding agents over MCP: Postgres, bearer auth, optimistic locking"
 keywords = ["mcp", "notes", "markdown", "postgres", "agent"]
 categories = ["command-line-utilities", "database"]
 
