@@ -18,7 +18,7 @@ pub enum CoreError {
     /// `put` was given an `expected_version` that is not the current one
     /// (or none, while the note already exists). `current` is what the
     /// caller should read before retrying.
-    #[error("version conflict on {path}: expected {expected:?}, current {current}")]
+    #[error("version conflict on {path}: expected {}, current {current}", .expected.map_or_else(|| "none".to_string(), |v| v.to_string()))]
     VersionConflict {
         path: String,
         expected: Option<i64>,

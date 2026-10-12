@@ -1,13 +1,17 @@
-//! [`NoteletMcp`]: the MCP server. Seven tools, three guide resources, two
-//! transports. Every tool is one [`NoteService`] call plus serialisation;
-//! domain errors come back as a failed tool result carrying
-//! `{ "kind": ..., "message": ... }` (and `current_version` on a conflict)
-//! so an agent can act on them without parsing prose.
+//! [`NoteletMcp`]: the MCP server. Eight tools, three guide resources, two
+//! transports. Every tool is one [`NoteService`] call plus serialisation.
+//! Writes (`note_put`, `note_append`, `note_delete`) answer a
+//! [`WriteOutcome`] (path, version, updated_at, size in bytes, sha256,
+//! changed) so the caller can verify the round trip without re-reading.
+//! Domain errors come back as a failed tool result carrying
+//! `{ "kind": ..., "message": ... }` (and `current_version` /
+//! `expected_version` on a conflict) so an agent can act on them without
+//! parsing prose.
 
 use std::sync::Arc;
 
-use notelet_core::service::FilterInput;
-use notelet_core::{CoreError, NoteService};
+use notelet_core::service::{FilterInput, History};
+use notelet_core::{CoreError, NoteService, WriteOutcome};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, ListResourcesResult, PaginatedRequestParams,
@@ -33,7 +37,7 @@ pub struct NoteletMcp {
 // tool inputs
 // ---------------------------------------------------------------------------
 
-/// `note_get` / `note_history` input.
+/// `note_get` input.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PathParams {
     /// Note path, e.g. `projects/x/journal.md`.
@@ -48,6 +52,15 @@ pub struct PutParams {
     /// The whole new body (Markdown).
     pub body: String,
     /// The version you last read. Omit to create a note that must not exist yet.
+    pub expected_version: Option<i64>,
+}
+
+/// `note_delete` input.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteParams {
+    /// Note path.
+    pub path: String,
+    /// The version you last read. Omit to delete whatever is there.
     pub expected_version: Option<i64>,
 }
 
@@ -81,7 +94,8 @@ pub struct ListParams {
     pub filters: Option<Vec<FilterParam>>,
     /// Page size, 1..=1000 (default 100).
     pub limit: Option<u32>,
-    /// `next_cursor` from the previous page.
+    /// `next_cursor` from the previous page (exclusive: the page starts
+    /// strictly after that path).
     pub cursor: Option<String>,
 }
 
@@ -94,7 +108,8 @@ pub struct SearchParams {
     pub prefix: Option<String>,
     /// Page size, 1..=1000 (default 100).
     pub limit: Option<u32>,
-    /// `next_cursor` from the previous page.
+    /// `next_cursor` from the previous page (exclusive: the page starts
+    /// strictly after that path).
     pub cursor: Option<String>,
 }
 
@@ -103,8 +118,11 @@ pub struct SearchParams {
 pub struct HistoryParams {
     /// Note path.
     pub path: String,
-    /// How many replaced bodies, newest first, 1..=50 (default 20).
+    /// How many replaced or deleted bodies, newest first, 1..=50 (default 20).
     pub limit: Option<u32>,
+    /// Include each revision's body (default true). `false` returns only
+    /// path, version, updated_at, updated_by and size (bytes, UTF-8).
+    pub include_body: Option<bool>,
 }
 
 /// `note_dump` input.
@@ -113,9 +131,10 @@ pub struct HistoryParams {
 pub struct DumpParams {
     /// Only paths starting with this. Empty = everything.
     pub prefix: Option<String>,
-    /// Page size, 1..=1000 (default 100).
+    /// Page size, 1..=100 (default 20): every item carries a body.
     pub limit: Option<u32>,
-    /// `next_cursor` from the previous page.
+    /// `next_cursor` from the previous page (exclusive: the page starts
+    /// strictly after that path).
     pub cursor: Option<String>,
 }
 
@@ -127,17 +146,33 @@ fn ok_json<S: serde::Serialize>(value: &S) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::json(value)?]))
 }
 
-/// A domain error as a failed tool result with a machine-readable body.
+fn write_json(r: Result<WriteOutcome, CoreError>) -> Result<CallToolResult, McpError> {
+    match r {
+        Ok(w) => ok_json(&w),
+        Err(e) => Ok(core_error(e)),
+    }
+}
+
+/// A domain error as a failed tool result with a machine-readable body. A
+/// conflict also carries `current_version` and `expected_version` (`null`
+/// when the caller passed none, i.e. tried to create).
 fn core_error(err: CoreError) -> CallToolResult {
-    let (kind, extra) = match &err {
-        CoreError::NotFound(_) => ("NotFound", None),
-        CoreError::InvalidPath(_) | CoreError::InvalidFilter(_) => ("Validation", None),
-        CoreError::VersionConflict { current, .. } => ("Conflict", Some(*current)),
-        CoreError::Storage(_) => ("Internal", None),
+    let kind = match &err {
+        CoreError::NotFound(_) => "NotFound",
+        CoreError::InvalidPath(_) | CoreError::InvalidFilter(_) => "Validation",
+        CoreError::VersionConflict { .. } => "Conflict",
+        CoreError::Storage(_) => "Internal",
     };
     let mut body = serde_json::json!({ "kind": kind, "message": err.to_string() });
-    if let (Some(cur), Some(obj)) = (extra, body.as_object_mut()) {
-        obj.insert("current_version".into(), serde_json::Value::from(cur));
+    if let (
+        CoreError::VersionConflict {
+            expected, current, ..
+        },
+        Some(obj),
+    ) = (&err, body.as_object_mut())
+    {
+        obj.insert("current_version".into(), serde_json::Value::from(*current));
+        obj.insert("expected_version".into(), serde_json::json!(expected));
     }
     CallToolResult::error(vec![ContentBlock::text(body.to_string())])
 }
@@ -179,41 +214,45 @@ impl NoteletMcp {
     }
 
     #[tool(
-        description = "Create or replace a note's whole body with optimistic locking. Omit expected_version to create (fails with kind=Conflict if it exists); pass the version you read to replace (fails with kind=Conflict and current_version if someone wrote in between — re-read, merge, retry). The replaced body is kept in history."
+        description = "Create or replace a note's whole body with optimistic locking. Omit expected_version to create (fails with kind=Conflict if it exists); pass the version you read to replace (fails with kind=Conflict and current_version if someone wrote in between — re-read, merge, retry). The replaced body is kept in history. A body identical to the current one changes nothing (changed=false). Returns path, version, updated_at, size (bytes, UTF-8), sha256, changed."
     )]
     async fn note_put(
         &self,
         Parameters(p): Parameters<PutParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self
-            .svc
-            .put(&p.path, &p.body, p.expected_version, &self.actor)
-            .await
-        {
-            Ok(n) => ok_json(
-                &serde_json::json!({ "path": n.path, "version": n.version, "updated_at": n.updated_at }),
-            ),
-            Err(e) => Ok(core_error(e)),
-        }
+        write_json(
+            self.svc
+                .put(&p.path, &p.body, p.expected_version, &self.actor)
+                .await,
+        )
     }
 
     #[tool(
-        description = "Append text to the end of a note (created if missing), on its own line. No version needed: an append cannot overwrite anyone. Use this for journals."
+        description = "Append text to the end of a note (created if missing), on its own line. No version needed: an append cannot overwrite anyone. Use this for journals; it is also the way to upload a large body in chunks: the first append creates the note. Returns path, version, updated_at, size (bytes, UTF-8), sha256, changed."
     )]
     async fn note_append(
         &self,
         Parameters(p): Parameters<AppendParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.svc.append(&p.path, &p.text, &self.actor).await {
-            Ok(n) => ok_json(
-                &serde_json::json!({ "path": n.path, "version": n.version, "updated_at": n.updated_at }),
-            ),
-            Err(e) => Ok(core_error(e)),
-        }
+        write_json(self.svc.append(&p.path, &p.text, &self.actor).await)
     }
 
     #[tool(
-        description = "List notes (path, version, updated_at, updated_by, size; no body) under a prefix, filtered by ANDed predicates {field, op, value}. Fields: path, updated_at, updated_by. Ops: eq ne like ilike gt lt gte lte. Ordered by path; pass next_cursor to page. See notelet://guides/filters."
+        description = "Remove a note. Its body stays readable through note_history as the last revision. Pass expected_version to refuse if someone wrote in between; omit it to delete whatever is there. Answers the removed note's version, size and sha256."
+    )]
+    async fn note_delete(
+        &self,
+        Parameters(p): Parameters<DeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        write_json(
+            self.svc
+                .delete(&p.path, p.expected_version, &self.actor)
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "List notes (path, version, updated_at, updated_by, size in bytes (UTF-8); no body) under a prefix, filtered by ANDed predicates {field, op, value}. Fields: path, updated_at, updated_by. Ops: eq ne like ilike gt lt gte lte. Ordered by path; pass next_cursor as cursor to page (exclusive: the page starts strictly after that path). Default 100, max 1000. See notelet://guides/filters."
     )]
     async fn note_list(
         &self,
@@ -230,7 +269,7 @@ impl NoteletMcp {
     }
 
     #[tool(
-        description = "Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. Returns path, a snippet around the first hit, updated_at. Ordered by path; paged by next_cursor."
+        description = "Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. Returns path, a snippet around the first hit, updated_at. Ordered by path; paged by next_cursor (exclusive: the page starts strictly after that path)."
     )]
     async fn note_search(
         &self,
@@ -247,20 +286,25 @@ impl NoteletMcp {
     }
 
     #[tool(
-        description = "Bodies that note_put replaced for this path, newest first (default 20, max 50). Appends do not create history."
+        description = "Bodies that note_put replaced or note_delete removed for this path, newest first (default 20, max 50). Appends do not create history. include_body=false returns only path, version, updated_at, updated_by, size (bytes, UTF-8)."
     )]
     async fn note_history(
         &self,
         Parameters(p): Parameters<HistoryParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.svc.history(&p.path, p.limit).await {
-            Ok(revs) => ok_json(&revs),
+        match self
+            .svc
+            .history(&p.path, p.limit, p.include_body.unwrap_or(true))
+            .await
+        {
+            Ok(History::Full(revs)) => ok_json(&revs),
+            Ok(History::Meta(revs)) => ok_json(&revs),
             Err(e) => Ok(core_error(e)),
         }
     }
 
     #[tool(
-        description = "Paths and full bodies under a prefix, ordered by path and paged. For backups, exports, or leaving notelet: the result is a file tree."
+        description = "Paths and full bodies under a prefix, ordered by path and paged: default 20, max 100 (bodies are heavy); pass next_cursor as cursor (exclusive). For backups, exports, or leaving notelet: the result is a file tree."
     )]
     async fn note_dump(
         &self,
@@ -288,8 +332,8 @@ impl ServerHandler for NoteletMcp {
             "notelet is a thin store of Markdown notes addressed by path \
              (projects/<repo>/journal.md, tasks/<task>/<file>.md, lists/<name>.md). \
              note_append for journals, note_get + note_put (with expected_version) \
-             for documents, note_list / note_search to find, note_history to recover, \
-             note_dump to export. Read notelet://guides/onboarding first."
+             for documents, note_delete to remove, note_list / note_search to find, \
+             note_history to recover, note_dump to export. Read notelet://guides/onboarding first."
                 .into(),
         );
         info
@@ -412,6 +456,90 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&text_of(&conflict)).unwrap();
         assert_eq!(body["kind"], "Conflict");
         assert_eq!(body["current_version"], 1);
+        assert_eq!(body["expected_version"], 9);
+
+        let create_again = s
+            .note_put(put("projects/x/a.md", "two", None))
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text_of(&create_again)).unwrap();
+        assert_eq!(body["kind"], "Conflict");
+        assert!(body["expected_version"].is_null());
+    }
+
+    fn put(path: &str, body: &str, expected_version: Option<i64>) -> Parameters<PutParams> {
+        Parameters(PutParams {
+            path: path.into(),
+            body: body.into(),
+            expected_version,
+        })
+    }
+
+    fn json_of(r: &CallToolResult) -> serde_json::Value {
+        assert_ne!(r.is_error, Some(true), "{}", text_of(r));
+        let c = r.content.first().expect("content");
+        match c.as_text() {
+            Some(t) => serde_json::from_str(&t.text).unwrap(),
+            None => serde_json::to_value(c).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_reports_sha256_and_changed() {
+        let s = server();
+        let w = json_of(&s.note_put(put("n/a.md", "héllo", None)).await.unwrap());
+        assert_eq!(w["version"], 1);
+        assert_eq!(w["changed"], true);
+        assert_eq!(w["size"], 6);
+        assert_eq!(
+            w["sha256"],
+            notelet_core::domain::sha256_hex("héllo").as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_same_body_reports_unchanged() {
+        let s = server();
+        s.note_put(put("n/a.md", "same", None)).await.unwrap();
+        let w = json_of(&s.note_put(put("n/a.md", "same", Some(1))).await.unwrap());
+        assert_eq!(w["changed"], false);
+        assert_eq!(w["version"], 1);
+    }
+
+    #[tokio::test]
+    async fn delete_then_get_is_not_found_and_history_keeps_it() {
+        let s = server();
+        s.note_put(put("n/d.md", "bye", None)).await.unwrap();
+        let w = json_of(
+            &s.note_delete(Parameters(DeleteParams {
+                path: "n/d.md".into(),
+                expected_version: Some(1),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(w["version"], 1);
+        let r = s
+            .note_get(Parameters(PathParams {
+                path: "n/d.md".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(body["kind"], "NotFound");
+
+        let h = json_of(
+            &s.note_history(Parameters(HistoryParams {
+                path: "n/d.md".into(),
+                limit: None,
+                include_body: Some(false),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(h[0]["size"], 3);
+        assert!(h[0].get("body").is_none());
     }
 
     #[tokio::test]
@@ -460,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_router_lists_seven_tools() {
+    fn tool_router_lists_eight_tools() {
         let names: Vec<String> = NoteletMcp::tool_router()
             .list_all()
             .into_iter()
@@ -470,6 +598,7 @@ mod tests {
             "note_get",
             "note_put",
             "note_append",
+            "note_delete",
             "note_list",
             "note_search",
             "note_history",
@@ -477,6 +606,6 @@ mod tests {
         ] {
             assert!(names.contains(&n.to_string()), "{n} missing from {names:?}");
         }
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 8);
     }
 }

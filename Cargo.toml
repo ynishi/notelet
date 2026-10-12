@@ -22,6 +22,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+sha2 = "0.10"
 
 # The profile that 'dist' will build with
 [profile.dist]

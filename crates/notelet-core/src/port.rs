@@ -2,19 +2,28 @@
 //! and an adapter; the Postgres adapter and the in-memory adapter both
 //! implement it, and the MCP binary holds it as `Arc<dyn NoteRepo>`.
 //!
-//! The port carries the locking semantics ([`NoteRepo::put`]) because the
-//! check-and-write must be atomic inside the adapter (a transaction in
-//! Postgres, a mutex in memory); the service cannot compose it from a `get`
-//! and a `set` without a race.
+//! The port carries the locking semantics ([`NoteRepo::put`],
+//! [`NoteRepo::delete`]) because the check-and-write must be atomic inside
+//! the adapter (a transaction in Postgres, a mutex in memory); the service
+//! cannot compose it from a `get` and a `set` without a race.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::domain::{
-    DumpEntry, Filter, Note, NoteMeta, NotePath, Page, PageOut, Revision, SearchHit,
+    DumpEntry, Filter, Note, NoteMeta, NotePath, Page, PageOut, Revision, RevisionMeta, SearchHit,
 };
 use crate::error::CoreError;
+
+/// What `put` reports: the note as stored, and whether anything changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutResult {
+    pub note: Note,
+    /// `false` when the body was identical to the current one: no version
+    /// bump, no revision. Makes re-runs and retries idempotent.
+    pub changed: bool,
+}
 
 /// A store of notes keyed by path.
 #[async_trait]
@@ -30,20 +39,39 @@ pub trait NoteRepo: Send + Sync {
     ///   otherwise [`CoreError::VersionConflict`]. [`CoreError::NotFound`] if
     ///   there is no note.
     ///
-    /// On replace, the previous body is recorded as a [`Revision`] under the
-    /// old version. The new version is `old + 1` (or 1 on create).
+    /// On replace, if the new body equals the current one nothing is written
+    /// (`changed = false`). Otherwise the previous body is recorded as a
+    /// [`Revision`] under the old version and the version becomes `old + 1`.
+    /// A create starts at 1, or one past the highest revision still kept
+    /// for the path (a note re-created after [`NoteRepo::delete`]), so
+    /// versions never repeat within a path.
     async fn put(
         &self,
         path: &NotePath,
         body: &str,
         expected: Option<i64>,
         by: &str,
-    ) -> Result<Note, CoreError>;
+    ) -> Result<PutResult, CoreError>;
 
     /// Append `text` (already newline-normalised by the service) to the end
     /// of the body, creating the note if needed. No version check, no
-    /// revision: an append cannot lose anyone's content.
+    /// revision: an append cannot lose anyone's content. Successive appends
+    /// are also the way to upload a large body in chunks.
     async fn append(&self, path: &NotePath, text: &str, by: &str) -> Result<Note, CoreError>;
+
+    /// Remove the note, keeping its current body as the last revision so
+    /// `history` can still read it. `expected = Some(v)` must match the
+    /// current version (else [`CoreError::VersionConflict`]); `None` deletes
+    /// whatever is there (unlike `put`, where `None` means "create").
+    /// [`CoreError::NotFound`] if there is no note. Returns the note as it
+    /// was. `by` is not recorded: the kept revision carries the last
+    /// writer's `updated_by`, and nothing names who deleted it.
+    async fn delete(
+        &self,
+        path: &NotePath,
+        expected: Option<i64>,
+        by: &str,
+    ) -> Result<Note, CoreError>;
 
     /// Notes whose path starts with `prefix` (empty = all) and satisfy every
     /// filter, ordered by path, paged.
@@ -64,8 +92,16 @@ pub trait NoteRepo: Send + Sync {
         page: &Page,
     ) -> Result<PageOut<SearchHit>, CoreError>;
 
-    /// Replaced bodies of `path`, newest first, at most `limit`.
+    /// Replaced (or deleted) bodies of `path`, newest first, at most `limit`.
     async fn history(&self, path: &NotePath, limit: u32) -> Result<Vec<Revision>, CoreError>;
+
+    /// The same revisions as [`NoteRepo::history`] without their bodies
+    /// (size in bytes instead), so the bodies are never read.
+    async fn history_meta(
+        &self,
+        path: &NotePath,
+        limit: u32,
+    ) -> Result<Vec<RevisionMeta>, CoreError>;
 
     /// Paths and full bodies under `prefix`, ordered by path, paged. For
     /// backups and for leaving: a dump is a file tree.
@@ -83,11 +119,19 @@ impl<T: NoteRepo + ?Sized> NoteRepo for Arc<T> {
         body: &str,
         expected: Option<i64>,
         by: &str,
-    ) -> Result<Note, CoreError> {
+    ) -> Result<PutResult, CoreError> {
         (**self).put(path, body, expected, by).await
     }
     async fn append(&self, path: &NotePath, text: &str, by: &str) -> Result<Note, CoreError> {
         (**self).append(path, text, by).await
+    }
+    async fn delete(
+        &self,
+        path: &NotePath,
+        expected: Option<i64>,
+        by: &str,
+    ) -> Result<Note, CoreError> {
+        (**self).delete(path, expected, by).await
     }
     async fn list(
         &self,
@@ -107,6 +151,13 @@ impl<T: NoteRepo + ?Sized> NoteRepo for Arc<T> {
     }
     async fn history(&self, path: &NotePath, limit: u32) -> Result<Vec<Revision>, CoreError> {
         (**self).history(path, limit).await
+    }
+    async fn history_meta(
+        &self,
+        path: &NotePath,
+        limit: u32,
+    ) -> Result<Vec<RevisionMeta>, CoreError> {
+        (**self).history_meta(path, limit).await
     }
     async fn dump(&self, prefix: &str, page: &Page) -> Result<PageOut<DumpEntry>, CoreError> {
         (**self).dump(prefix, page).await

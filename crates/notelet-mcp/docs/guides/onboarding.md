@@ -13,14 +13,40 @@ lists/<name>.md                 private lists the agent consults
 A path is slash-separated segments of `[A-Za-z0-9._-]`. Nothing else is
 accepted: no spaces, no `..`, no leading slash.
 
+Nested projects keep their `/` as is and may go deep:
+`projects/x/sub-a/journal.md` is a fine path. Narrow with a prefix
+(`note_list { prefix: "projects/x/sub-a/" }`) rather than flattening the
+name.
+
+Sizes (`size` in listings, history and write results) are bytes of UTF-8,
+not characters. Cursors are exclusive: a page starts strictly after the
+path you pass.
+
 ## One pass through the tools
 
 1. **Write a journal line.** `note_append { path: "projects/x/journal.md", text: "2026-10-12 started the migration" }`. The note is created if missing; the text lands on its own line. No version is needed.
 2. **Read a document.** `note_get { path: "tasks/t/plan.md" }` returns the body and its `version`. Keep the version.
-3. **Replace a document.** `note_put { path, body, expected_version: <the version you read> }`. If someone wrote in between you get `kind: "Conflict"` with `current_version`; read again, merge, retry. To create a document that must not exist yet, omit `expected_version`.
+3. **Replace a document.** `note_put { path, body, expected_version: <the version you read> }`. If someone wrote in between you get `kind: "Conflict"` with `current_version`; read again, merge, retry. To create a document that must not exist yet, omit `expected_version`. Every write answers `{ path, version, updated_at, size, sha256, changed }`; compare `size` / `sha256` with what you sent instead of reading the body back.
 4. **Find things.** `note_list { prefix: "projects/x/" }` for metadata (no bodies); add `filters` to narrow (see `notelet://guides/filters`). `note_search { text: "release-plz" }` for a case-insensitive substring over bodies, with a snippet.
-5. **Recover.** `note_history { path }` lists the bodies that `note_put` replaced, newest first.
-6. **Leave or back up.** `note_dump { prefix }` returns paths and full bodies, paged; written to disk it is a file tree.
+5. **Recover.** `note_history { path }` lists the bodies that `note_put` replaced or `note_delete` removed, newest first; `include_body: false` lists only their metadata.
+6. **Leave or back up.** `note_dump { prefix }` returns paths and full bodies, paged (default 20, max 100 per page); written to disk it is a file tree.
+
+## Bulk import and export
+
+Moving a whole file tree in or out is not done through MCP tools (it would
+pass every body through an agent's context). The operator runs the binary
+against the database instead:
+
+```
+notelet-mcp import <dir> [--prefix projects/x] [--dry-run]
+notelet-mcp export <dir> [--prefix projects/x]
+```
+
+`import` maps each file to `<prefix>/<path relative to dir>`, replaces
+existing notes at their current version (identical bodies are left
+alone), skips hidden files, symlinks, non-UTF-8 files and invalid paths,
+and prints `created / updated / unchanged / skipped / failed` counts.
+`export` writes every note to `<dir>/<path>`.
 
 ## What notelet does not do
 

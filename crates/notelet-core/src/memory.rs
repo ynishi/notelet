@@ -1,6 +1,6 @@
 //! An in-memory [`NoteRepo`] for tests and dry runs. It mirrors the Postgres
 //! adapter's semantics (ordering by path, keyset paging, LIKE patterns,
-//! revision on replace) so the service tests exercise the same contract the
+//! revision on replace and delete, no-op on an identical body) so the service tests exercise the same contract the
 //! binary will meet in production.
 
 use std::collections::BTreeMap;
@@ -11,10 +11,10 @@ use tokio::sync::Mutex;
 
 use crate::domain::{
     DumpEntry, Field, Filter, FilterValue, Note, NoteMeta, NotePath, Op, Page, PageOut, Revision,
-    SearchHit,
+    RevisionMeta, SearchHit,
 };
 use crate::error::CoreError;
-use crate::port::NoteRepo;
+use crate::port::{NoteRepo, PutResult};
 
 /// Notes in a `BTreeMap` (so iteration is already ordered by path).
 #[derive(Default)]
@@ -26,6 +26,32 @@ pub struct MemoryNoteRepo {
 struct Inner {
     notes: BTreeMap<String, Note>,
     revisions: Vec<Revision>,
+}
+
+impl Inner {
+    /// The version a newly created note at `path` starts at: one past the
+    /// highest revision kept for it (1 when there is none), so a note
+    /// re-created after `delete` never reuses a revision's version.
+    fn first_version(&self, path: &NotePath) -> i64 {
+        self.revisions
+            .iter()
+            .filter(|r| r.path == *path)
+            .map(|r| r.version)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+}
+
+/// The current note, kept as the revision of its own version.
+fn revision_of(n: Note) -> Revision {
+    Revision {
+        path: n.path,
+        version: n.version,
+        body: n.body,
+        updated_at: n.updated_at,
+        updated_by: n.updated_by,
+    }
 }
 
 /// SQL `LIKE` semantics: `%` any run, `_` one char, `\` escapes.
@@ -109,7 +135,7 @@ impl NoteRepo for MemoryNoteRepo {
         body: &str,
         expected: Option<i64>,
         by: &str,
-    ) -> Result<Note, CoreError> {
+    ) -> Result<PutResult, CoreError> {
         let mut g = self.inner.lock().await;
         let current = g.notes.get(path.as_str()).cloned();
         let next = match (expected, current) {
@@ -128,43 +154,72 @@ impl NoteRepo for MemoryNoteRepo {
                     current: cur.version,
                 })
             }
+            (Some(_), Some(cur)) if cur.body == body => {
+                return Ok(PutResult {
+                    note: cur,
+                    changed: false,
+                })
+            }
             (None, None) => Note {
                 path: path.clone(),
                 body: body.to_string(),
-                version: 1,
+                version: g.first_version(path),
                 updated_at: Utc::now(),
                 updated_by: by.to_string(),
             },
             (Some(_), Some(cur)) => {
-                g.revisions.push(Revision {
-                    path: cur.path.clone(),
-                    version: cur.version,
-                    body: cur.body.clone(),
-                    updated_at: cur.updated_at,
-                    updated_by: cur.updated_by.clone(),
-                });
+                let version = cur.version + 1;
+                g.revisions.push(revision_of(cur));
                 Note {
                     path: path.clone(),
                     body: body.to_string(),
-                    version: cur.version + 1,
+                    version,
                     updated_at: Utc::now(),
                     updated_by: by.to_string(),
                 }
             }
         };
         g.notes.insert(path.as_str().to_string(), next.clone());
-        Ok(next)
+        Ok(PutResult {
+            note: next,
+            changed: true,
+        })
+    }
+
+    async fn delete(
+        &self,
+        path: &NotePath,
+        expected: Option<i64>,
+        _by: &str,
+    ) -> Result<Note, CoreError> {
+        let mut g = self.inner.lock().await;
+        let Some(cur) = g.notes.get(path.as_str()).cloned() else {
+            return Err(CoreError::NotFound(path.to_string()));
+        };
+        if let Some(e) = expected {
+            if cur.version != e {
+                return Err(CoreError::VersionConflict {
+                    path: path.to_string(),
+                    expected: Some(e),
+                    current: cur.version,
+                });
+            }
+        }
+        g.revisions.push(revision_of(cur.clone()));
+        g.notes.remove(path.as_str());
+        Ok(cur)
     }
 
     async fn append(&self, path: &NotePath, text: &str, by: &str) -> Result<Note, CoreError> {
         let mut g = self.inner.lock().await;
+        let start = g.first_version(path) - 1;
         let entry = g
             .notes
             .entry(path.as_str().to_string())
             .or_insert_with(|| Note {
                 path: path.clone(),
                 body: String::new(),
-                version: 0,
+                version: start,
                 updated_at: Utc::now(),
                 updated_by: by.to_string(),
             });
@@ -239,6 +294,29 @@ impl NoteRepo for MemoryNoteRepo {
             .iter()
             .filter(|r| r.path == *path)
             .cloned()
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.version));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn history_meta(
+        &self,
+        path: &NotePath,
+        limit: u32,
+    ) -> Result<Vec<RevisionMeta>, CoreError> {
+        let g = self.inner.lock().await;
+        let mut rows: Vec<RevisionMeta> = g
+            .revisions
+            .iter()
+            .filter(|r| r.path == *path)
+            .map(|r| RevisionMeta {
+                path: r.path.clone(),
+                version: r.version,
+                updated_at: r.updated_at,
+                updated_by: r.updated_by.clone(),
+                size: r.body.len() as i64,
+            })
             .collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.version));
         rows.truncate(limit as usize);

@@ -36,6 +36,8 @@ The `prefix` of `note_list` / `note_search` / `note_dump` and the `text` of
 ## Paging
 
 Results are ordered by path. A page carries `next_cursor` when more rows
-follow; pass it back as `cursor` to continue. The cursor is the last path
-of the page, so paging is stable while notes are being added. `limit` is
-clamped to 1..=1000 (default 100).
+follow; pass it back as `cursor` to continue. The cursor is exclusive: it
+is the last path of the page, and the next page starts strictly after it,
+so paging is stable while notes are being added. `limit` is clamped to
+1..=1000 (default 100); `note_dump` pages are 1..=100 (default 20) because
+every item carries a body. `size` is in bytes (UTF-8).

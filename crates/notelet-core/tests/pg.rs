@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use notelet_core::{CoreError, NoteService, PgNoteRepo};
+use notelet_core::{CoreError, History, NoteService, PgNoteRepo};
 
 #[tokio::test]
 async fn round_trip_against_postgres() {
@@ -26,9 +26,22 @@ async fn round_trip_against_postgres() {
     assert!(matches!(e, CoreError::VersionConflict { current: 1, .. }));
     let n = svc.put(&p("a.md"), "two", Some(1), "t").await.unwrap();
     assert_eq!(n.version, 2);
-    let h = svc.history(&p("a.md"), None).await.unwrap();
+    assert!(n.changed);
+    let History::Full(h) = svc.history(&p("a.md"), None, true).await.unwrap() else {
+        panic!("full history expected")
+    };
     assert_eq!(h.len(), 1);
     assert_eq!(h[0].body, "one");
+
+    // the same body again is a no-op: no bump, no revision
+    let n = svc.put(&p("a.md"), "two", Some(2), "t").await.unwrap();
+    assert!(!n.changed);
+    assert_eq!(n.version, 2);
+    let History::Meta(h) = svc.history(&p("a.md"), None, false).await.unwrap() else {
+        panic!("meta history expected")
+    };
+    assert_eq!(h.len(), 1);
+    assert_eq!(h[0].size, 3);
 
     // append twice lands on separate lines
     svc.append(&p("j.md"), "first", "t").await.unwrap();
@@ -46,6 +59,44 @@ async fn round_trip_against_postgres() {
     assert!(s.items[0].snippet.contains("second"));
     let d = svc.dump(Some(&prefix), None, None).await.unwrap();
     assert_eq!(d.items.len(), 2);
+
+    // delete keeps the body as the last revision; re-creating continues the
+    // version so a later replace does not collide with the kept revisions
+    let e = svc.delete(&p("a.md"), Some(9), "t").await.unwrap_err();
+    assert!(matches!(e, CoreError::VersionConflict { current: 2, .. }));
+    let w = svc.delete(&p("a.md"), Some(2), "t").await.unwrap();
+    assert_eq!(w.version, 2);
+    assert!(matches!(
+        svc.get(&p("a.md")).await.unwrap_err(),
+        CoreError::NotFound(_)
+    ));
+    let History::Full(h) = svc.history(&p("a.md"), None, true).await.unwrap() else {
+        panic!("full history expected")
+    };
+    assert_eq!(h[0].version, 2);
+    assert_eq!(h[0].body, "two");
+    let n = svc.put(&p("a.md"), "three", None, "t").await.unwrap();
+    assert_eq!(n.version, 3);
+    let n = svc.put(&p("a.md"), "four", Some(3), "t").await.unwrap();
+    assert_eq!(n.version, 4);
+
+    // append re-creates a deleted note one past its highest revision, and a
+    // later replace / delete does not collide with the kept revisions
+    let w = svc.delete(&p("j.md"), None, "t").await.unwrap();
+    assert_eq!(w.version, 2);
+    let w = svc.append(&p("j.md"), "again", "t").await.unwrap();
+    assert_eq!(w.version, 3);
+    assert_eq!(svc.get(&p("j.md")).await.unwrap().body, "again\n");
+    let w = svc.put(&p("j.md"), "replaced", Some(3), "t").await.unwrap();
+    assert_eq!(w.version, 4);
+    let w = svc.delete(&p("j.md"), Some(4), "t").await.unwrap();
+    assert_eq!(w.version, 4);
+    let History::Meta(h) = svc.history(&p("j.md"), None, false).await.unwrap() else {
+        panic!("meta history expected")
+    };
+    let versions: Vec<i64> = h.iter().map(|r| r.version).collect();
+    assert_eq!(versions, vec![4, 3, 2]);
+    assert_eq!(h[0].size, 8);
 
     // cleanup
     sqlx::query("DELETE FROM revisions WHERE path LIKE $1")

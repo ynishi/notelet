@@ -22,6 +22,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["sync"] }
 tracing = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
     "runtime-tokio",

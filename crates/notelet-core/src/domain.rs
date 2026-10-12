@@ -119,11 +119,60 @@ pub struct NoteMeta {
     pub version: i64,
     pub updated_at: DateTime<Utc>,
     pub updated_by: String,
-    /// Body length in bytes.
+    /// Body length in bytes (UTF-8).
     pub size: i64,
 }
 
-/// A body that a `put` replaced.
+/// What a write (`put`, `append`, `delete`) reports back: enough for the
+/// caller to verify the round trip without reading the body again. For
+/// `delete` it describes the removed note (its last version, size and
+/// SHA-256), which is also what `history` now holds as the newest revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteOutcome {
+    pub path: NotePath,
+    pub version: i64,
+    pub updated_at: DateTime<Utc>,
+    /// Body length in bytes (UTF-8) after the write.
+    pub size: i64,
+    /// Hex SHA-256 of the body after the write.
+    pub sha256: String,
+    /// `false` when a `put` carried a body identical to the current one and
+    /// therefore changed nothing (no version bump, no revision).
+    pub changed: bool,
+}
+
+impl WriteOutcome {
+    /// Describe `note` as the result of a write.
+    pub fn of(note: &Note, changed: bool) -> Self {
+        Self {
+            path: note.path.clone(),
+            version: note.version,
+            updated_at: note.updated_at,
+            size: note.body.len() as i64,
+            sha256: sha256_hex(&note.body),
+            changed,
+        }
+    }
+}
+
+/// A revision without its body, for `history` when bodies are not wanted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionMeta {
+    pub path: NotePath,
+    pub version: i64,
+    pub updated_at: DateTime<Utc>,
+    pub updated_by: String,
+    /// Body length in bytes (UTF-8).
+    pub size: i64,
+}
+
+/// Hex SHA-256 of `body`.
+pub fn sha256_hex(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+/// A body that a `put` replaced or a `delete` removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revision {
     pub path: NotePath,
@@ -294,11 +343,29 @@ impl Page {
     /// Largest page a caller may ask for.
     pub const MAX_LIMIT: u32 = 1000;
 
+    /// Default and largest page for operations that return whole bodies
+    /// (`dump`): smaller, because each item is heavy.
+    pub const DEFAULT_BODY_LIMIT: u32 = 20;
+    /// See [`Page::DEFAULT_BODY_LIMIT`].
+    pub const MAX_BODY_LIMIT: u32 = 100;
+
     /// Clamp `limit` into `1..=MAX_LIMIT` (default 100) and keep the cursor.
     pub fn new(limit: Option<u32>, cursor: Option<String>) -> Self {
-        let limit = limit
-            .unwrap_or(Self::DEFAULT_LIMIT)
-            .clamp(1, Self::MAX_LIMIT);
+        Self::capped(limit, cursor, Self::DEFAULT_LIMIT, Self::MAX_LIMIT)
+    }
+
+    /// Clamp `limit` into `1..=MAX_BODY_LIMIT` (default 20); for `dump`.
+    pub fn for_bodies(limit: Option<u32>, cursor: Option<String>) -> Self {
+        Self::capped(
+            limit,
+            cursor,
+            Self::DEFAULT_BODY_LIMIT,
+            Self::MAX_BODY_LIMIT,
+        )
+    }
+
+    fn capped(limit: Option<u32>, cursor: Option<String>, default: u32, max: u32) -> Self {
+        let limit = limit.unwrap_or(default).clamp(1, max);
         Self { limit, cursor }
     }
 }
@@ -420,6 +487,24 @@ mod tests {
         assert_eq!(p.next_cursor.as_deref(), Some("b"));
         let p = PageOut::from_overfetch(rows, 3, |s| s.as_str());
         assert_eq!(p.next_cursor, None);
+    }
+
+    #[test]
+    fn body_page_is_smaller() {
+        assert_eq!(Page::for_bodies(None, None).limit, Page::DEFAULT_BODY_LIMIT);
+        assert_eq!(
+            Page::for_bodies(Some(999), None).limit,
+            Page::MAX_BODY_LIMIT
+        );
+    }
+
+    #[test]
+    fn sha256_is_hex_of_utf8() {
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(sha256_hex("abc").len(), 64);
     }
 
     #[test]

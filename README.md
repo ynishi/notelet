@@ -1,6 +1,6 @@
 # notelet
 
-A thin, hosted store for Markdown notes that coding agents read and write over MCP. One table of notes keyed by path, one append-only history table, optimistic locking, a filter that is a thin wrapper over SQL, and seven tools. Nothing else.
+A thin, hosted store for Markdown notes that coding agents read and write over MCP. One table of notes keyed by path, one append-only history table, optimistic locking, a filter that is a thin wrapper over SQL, and eight tools. Nothing else.
 
 ## Why
 
@@ -10,9 +10,9 @@ Agents accumulate working state: journals, design drafts, private lists. Keep it
 
 ```
 Note        path -> body (Markdown), version, updated_at, updated_by
-Revision    the body a put replaced, keyed by (path, version)
+Revision    the body a put replaced or a delete removed, keyed by (path, version)
 Filter      field (path | updated_at | updated_by) x op (eq ne like ilike gt lt gte lte) x value
-Page        limit (1..=1000) + keyset cursor
+Page        limit (1..=1000; dump 1..=100) + exclusive keyset cursor
 ```
 
 Paths are slash-separated segments of `[A-Za-z0-9._-]`; the tree (`projects/<repo>/journal.md`, `tasks/<task>/...`, `lists/<name>.md`) is a naming convention served by the prefix listing, not a directory object.
@@ -20,12 +20,17 @@ Paths are slash-separated segments of `[A-Za-z0-9._-]`; the tree (`projects/<rep
 | tool | does |
 |---|---|
 | `note_get` | read one note with its version |
-| `note_put` | create or replace the whole body; `expected_version` must match or you get `Conflict` with `current_version` |
-| `note_append` | add a line at the end, no version needed (journals) |
-| `note_list` | metadata under a prefix, filtered, paged |
+| `note_put` | create or replace the whole body; `expected_version` must match or you get `Conflict` with `current_version`; an identical body is a no-op (`changed: false`) |
+| `note_append` | add a line at the end, no version needed (journals, or uploading a large body in chunks) |
+| `note_delete` | remove a note; its body stays readable through `note_history` |
+| `note_list` | metadata (size in bytes) under a prefix, filtered, paged |
 | `note_search` | case-insensitive substring over bodies, with a snippet |
-| `note_history` | bodies that `note_put` replaced |
+| `note_history` | bodies that `note_put` replaced or `note_delete` removed (`include_body: false` for metadata only) |
 | `note_dump` | paths and bodies under a prefix: a file tree, for backup or for leaving |
+
+Writes answer `{ path, version, updated_at, size, sha256, changed }` so a caller can verify a round trip without reading the body back.
+
+Bulk loading is not a tool: the operator runs `notelet-mcp import <dir> [--prefix <p>] [--dry-run]` and `notelet-mcp export <dir> [--prefix <p>]` against the database directly.
 
 The guides the server publishes as MCP resources (`notelet://guides/onboarding`, `locking`, `filters`) are the usage documentation; this README does not repeat them.
 
@@ -40,6 +45,8 @@ export NOTELET_BIND=127.0.0.1:8490              # default; non-loopback requires
 notelet-mcp serve                               # streamable HTTP at /mcp, /healthz open
 notelet-mcp stdio                               # one local client over stdin/stdout
 notelet-mcp migrate                             # apply migrations and exit
+notelet-mcp import ./notes --prefix projects/x  # file tree -> notes (--dry-run to preview)
+notelet-mcp export ./backup                     # notes -> file tree
 ```
 
 Migrations are embedded and applied on start.

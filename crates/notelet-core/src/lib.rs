@@ -18,9 +18,9 @@
 //!
 //! ```text
 //! Note        path -> body (Markdown), version, updated_at, updated_by
-//! Revision    the body a `put` replaced, keyed by (path, version)
+//! Revision    the body a `put` replaced or a `delete` removed, keyed by (path, version)
 //! Filter      field (path | updated_at | updated_by) × op (eq ne like ilike gt lt gte lte) × value
-//! Page        limit (1..=1000) + keyset cursor (the last path of the previous page)
+//! Page        limit (1..=1000; dump 1..=100) + exclusive keyset cursor (the last path of the previous page)
 //! ```
 //!
 //! Paths are slash-separated segments of `[A-Za-z0-9._-]`; the tree is only
@@ -32,8 +32,15 @@
 //! `put` is optimistic: the caller passes the version it last read; the store
 //! replaces the body only if that is still the current version, otherwise it
 //! answers [`CoreError::VersionConflict`] with the current version. There is
-//! no lease and no explicit lock. `append` needs no version at all: it adds a
-//! line to the end and cannot clobber anyone.
+//! no lease and no explicit lock. A `put` of a body identical to the current
+//! one changes nothing (`changed: false`), so retries are idempotent.
+//! `append` needs no version at all: it adds a line to the end and cannot
+//! clobber anyone. `delete` with a version removes the note only if that is
+//! still the current version; without one it removes whatever is there
+//! (whereas a `put` without a version means "create"). It keeps the removed
+//! body as the last revision. Every write answers a
+//! [`domain::WriteOutcome`] (version, byte size, SHA-256, changed); for
+//! `delete` these describe the note it removed.
 //!
 //! ## Layout (lightweight DDD / Clean)
 //!
@@ -63,10 +70,11 @@ pub mod port;
 pub mod service;
 
 pub use domain::{
-    DumpEntry, Field, Filter, Note, NoteMeta, NotePath, Op, Page, PageOut, Revision, SearchHit,
+    DumpEntry, Field, Filter, Note, NoteMeta, NotePath, Op, Page, PageOut, Revision, RevisionMeta,
+    SearchHit, WriteOutcome,
 };
 pub use error::CoreError;
 pub use memory::MemoryNoteRepo;
 pub use pg::PgNoteRepo;
-pub use port::NoteRepo;
-pub use service::NoteService;
+pub use port::{NoteRepo, PutResult};
+pub use service::{History, NoteService};

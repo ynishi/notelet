@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::domain::{
     normalize_append, validate_prefix, DumpEntry, Filter, Note, NoteMeta, NotePath, Page, PageOut,
-    Revision, SearchHit,
+    Revision, RevisionMeta, SearchHit, WriteOutcome,
 };
 use crate::error::CoreError;
 use crate::port::NoteRepo;
@@ -26,6 +26,13 @@ pub struct FilterInput {
     pub value: String,
 }
 
+/// `history` with or without bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum History {
+    Full(Vec<Revision>),
+    Meta(Vec<RevisionMeta>),
+}
+
 impl NoteService {
     /// Wrap a repository.
     pub fn new(repo: Arc<dyn NoteRepo>) -> Self {
@@ -42,23 +49,42 @@ impl NoteService {
     }
 
     /// Create (`expected_version = None`) or replace (`Some(v)`) a note.
-    /// See [`NoteRepo::put`] for the locking rules.
+    /// See [`NoteRepo::put`] for the locking and idempotency rules.
     pub async fn put(
         &self,
         path: &str,
         body: &str,
         expected_version: Option<i64>,
         by: &str,
-    ) -> Result<Note, CoreError> {
+    ) -> Result<WriteOutcome, CoreError> {
         let path = NotePath::parse(path)?;
-        self.repo.put(&path, body, expected_version, by).await
+        let r = self.repo.put(&path, body, expected_version, by).await?;
+        Ok(WriteOutcome::of(&r.note, r.changed))
     }
 
     /// Append a line (newline-normalised) to a note, creating it if needed.
-    pub async fn append(&self, path: &str, text: &str, by: &str) -> Result<Note, CoreError> {
+    pub async fn append(
+        &self,
+        path: &str,
+        text: &str,
+        by: &str,
+    ) -> Result<WriteOutcome, CoreError> {
         let path = NotePath::parse(path)?;
         let text = normalize_append(text);
-        self.repo.append(&path, &text, by).await
+        let note = self.repo.append(&path, &text, by).await?;
+        Ok(WriteOutcome::of(&note, true))
+    }
+
+    /// Delete a note (its body stays readable through `history`).
+    pub async fn delete(
+        &self,
+        path: &str,
+        expected_version: Option<i64>,
+        by: &str,
+    ) -> Result<WriteOutcome, CoreError> {
+        let path = NotePath::parse(path)?;
+        let note = self.repo.delete(&path, expected_version, by).await?;
+        Ok(WriteOutcome::of(&note, true))
     }
 
     /// List note metadata under a prefix with optional filters.
@@ -96,18 +122,25 @@ impl NoteService {
         self.repo.search(text, prefix, &page).await
     }
 
-    /// Replaced bodies of a note, newest first (at most 50).
+    /// Replaced (or deleted) bodies of a note, newest first (at most 50),
+    /// with or without the bodies themselves.
     pub async fn history(
         &self,
         path: &str,
         limit: Option<u32>,
-    ) -> Result<Vec<Revision>, CoreError> {
+        include_body: bool,
+    ) -> Result<History, CoreError> {
         let path = NotePath::parse(path)?;
         let limit = limit.unwrap_or(20).clamp(1, 50);
-        self.repo.history(&path, limit).await
+        Ok(if include_body {
+            History::Full(self.repo.history(&path, limit).await?)
+        } else {
+            History::Meta(self.repo.history_meta(&path, limit).await?)
+        })
     }
 
-    /// Paths and bodies under a prefix, for backup or export.
+    /// Paths and bodies under a prefix, for backup or export. Pages are
+    /// smaller than for listings because every item carries a body.
     pub async fn dump(
         &self,
         prefix: Option<&str>,
@@ -116,7 +149,7 @@ impl NoteService {
     ) -> Result<PageOut<DumpEntry>, CoreError> {
         let prefix = prefix.unwrap_or("");
         validate_prefix(prefix)?;
-        let page = Page::new(limit, cursor);
+        let page = Page::for_bodies(limit, cursor);
         self.repo.dump(prefix, &page).await
     }
 }
@@ -141,8 +174,11 @@ mod tests {
     #[tokio::test]
     async fn put_create_then_replace_with_version() {
         let s = svc();
-        let n = s.put("projects/x/a.md", "one", None, "t").await.unwrap();
-        assert_eq!(n.version, 1);
+        let w = s.put("projects/x/a.md", "one", None, "t").await.unwrap();
+        assert_eq!(w.version, 1);
+        assert!(w.changed);
+        assert_eq!(w.size, 3);
+        assert_eq!(w.sha256.len(), 64);
 
         // creating again without a version is a conflict carrying the current one
         let e = s
@@ -153,6 +189,7 @@ mod tests {
             matches!(e, CoreError::VersionConflict { current: 1, .. }),
             "{e}"
         );
+        assert!(e.to_string().contains("expected none, current 1"), "{e}");
 
         // wrong version is a conflict
         let e = s
@@ -160,14 +197,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(e, CoreError::VersionConflict { current: 1, .. }));
+        assert!(e.to_string().contains("expected 7, current 1"), "{e}");
 
         // right version replaces and bumps
-        let n = s.put("projects/x/a.md", "two", Some(1), "t").await.unwrap();
-        assert_eq!(n.version, 2);
+        let w = s.put("projects/x/a.md", "two", Some(1), "t").await.unwrap();
+        assert_eq!(w.version, 2);
+        assert!(w.changed);
         assert_eq!(s.get("projects/x/a.md").await.unwrap().body, "two");
 
         // the replaced body is in history
-        let h = s.history("projects/x/a.md", None).await.unwrap();
+        let h = s.history("projects/x/a.md", None, true).await.unwrap();
+        let History::Full(h) = h else { panic!() };
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].version, 1);
         assert_eq!(h[0].body, "one");
@@ -181,22 +221,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_same_body_is_a_noop() {
+        let s = svc();
+        s.put("n/a.md", "same", None, "t").await.unwrap();
+        let w = s.put("n/a.md", "same", Some(1), "t").await.unwrap();
+        assert!(!w.changed);
+        assert_eq!(w.version, 1);
+        let History::Meta(h) = s.history("n/a.md", None, false).await.unwrap() else {
+            panic!()
+        };
+        assert!(h.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_keeps_body_in_history() {
+        let s = svc();
+        s.put("n/d.md", "bye", None, "t").await.unwrap();
+        let e = s.delete("n/d.md", Some(9), "t").await.unwrap_err();
+        assert!(matches!(e, CoreError::VersionConflict { current: 1, .. }));
+        let w = s.delete("n/d.md", Some(1), "t").await.unwrap();
+        assert_eq!(w.version, 1);
+        assert!(matches!(
+            s.get("n/d.md").await.unwrap_err(),
+            CoreError::NotFound(_)
+        ));
+        let History::Full(h) = s.history("n/d.md", None, true).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].body, "bye");
+        assert!(matches!(
+            s.delete("n/d.md", None, "t").await.unwrap_err(),
+            CoreError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recreate_after_delete_continues_the_version() {
+        let s = svc();
+        s.put("n/r.md", "a", None, "t").await.unwrap();
+        s.put("n/r.md", "b", Some(1), "t").await.unwrap();
+        s.delete("n/r.md", None, "t").await.unwrap();
+        let w = s.put("n/r.md", "c", None, "t").await.unwrap();
+        assert_eq!(w.version, 3);
+        s.delete("n/r.md", Some(3), "t").await.unwrap();
+        let w = s.append("n/r.md", "d", "t").await.unwrap();
+        assert_eq!(w.version, 4);
+        let History::Meta(h) = s.history("n/r.md", None, false).await.unwrap() else {
+            panic!()
+        };
+        let versions: Vec<i64> = h.iter().map(|r| r.version).collect();
+        assert_eq!(versions, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
     async fn append_creates_and_adds_lines_without_version() {
         let s = svc();
         s.append("projects/x/journal.md", "first", "t")
             .await
             .unwrap();
-        s.append("projects/x/journal.md", "second\n", "t")
+        let w = s
+            .append("projects/x/journal.md", "second\n", "t")
             .await
             .unwrap();
+        assert_eq!(w.version, 2);
         let n = s.get("projects/x/journal.md").await.unwrap();
         assert_eq!(n.body, "first\nsecond\n");
-        assert_eq!(n.version, 2);
-        assert!(s
-            .history("projects/x/journal.md", None)
+        let History::Meta(h) = s
+            .history("projects/x/journal.md", None, false)
             .await
             .unwrap()
-            .is_empty());
+        else {
+            panic!()
+        };
+        assert!(h.is_empty());
     }
 
     #[tokio::test]
@@ -220,6 +318,7 @@ mod tests {
         let all = s.list(None, &[], None, None).await.unwrap();
         assert_eq!(all.items.len(), 4);
         assert_eq!(all.next_cursor, None);
+        assert_eq!(all.items[0].size, 4);
 
         let t = s.list(Some("tasks/"), &[], None, None).await.unwrap();
         assert_eq!(t.items.len(), 2);
@@ -272,12 +371,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dump_returns_bodies_under_prefix() {
+    async fn dump_returns_bodies_under_prefix_in_small_pages() {
         let s = svc();
         s.put("lists/a.md", "A", None, "t").await.unwrap();
         s.put("projects/x/j.md", "J", None, "t").await.unwrap();
         let d = s.dump(Some("lists/"), None, None).await.unwrap();
         assert_eq!(d.items.len(), 1);
         assert_eq!(d.items[0].body, "A");
+        let d = s.dump(None, Some(1), None).await.unwrap();
+        assert_eq!(d.items.len(), 1);
+        assert!(d.next_cursor.is_some());
     }
 }

@@ -11,8 +11,18 @@
 //!    are literal; only the `like` / `ilike` filter ops hand the caller's
 //!    pattern through verbatim, which is their point.
 //!
-//! `put` runs in a transaction with `SELECT ... FOR UPDATE` so the version
-//! check and the write cannot interleave with another writer.
+//! `put`, `append` and `delete` run in a transaction with
+//! `SELECT ... FOR UPDATE` so the read of the current row and the write
+//! cannot interleave with another writer. (A single-statement upsert would
+//! not do for `append`: its "one past the highest revision" subquery reads
+//! the statement snapshot, so after waiting on a concurrent `delete` it
+//! could insert a version that the delete has just kept as a revision.)
+//! When no row exists yet, two first appends can both reach the INSERT; the
+//! loser gets a unique violation and retries once, finding the row.
+//!
+//! A note created at a path that still has revisions (it was deleted
+//! earlier) starts one past the highest of them, so its later revisions
+//! never collide with the kept ones on `(path, version)`.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -21,15 +31,39 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
 use crate::domain::{
     escape_like, DumpEntry, Filter, FilterValue, Note, NoteMeta, NotePath, Page, PageOut, Revision,
-    SearchHit,
+    RevisionMeta, SearchHit,
 };
 use crate::error::CoreError;
-use crate::port::NoteRepo;
+use crate::port::{NoteRepo, PutResult};
 
 /// Notes in Postgres.
 #[derive(Clone)]
 pub struct PgNoteRepo {
     pool: PgPool,
+}
+
+/// Why one `append` attempt failed: `Exists` (another writer created the
+/// note between our lock and our insert) is retried, the rest is final.
+enum AppendError {
+    Exists,
+    Sql(sqlx::Error),
+    Core(CoreError),
+}
+
+impl From<sqlx::Error> for AppendError {
+    fn from(e: sqlx::Error) -> Self {
+        AppendError::Sql(e)
+    }
+}
+
+impl AppendError {
+    fn into_core(self) -> CoreError {
+        match self {
+            AppendError::Exists => CoreError::Storage("append: note created concurrently".into()),
+            AppendError::Sql(e) => e.into(),
+            AppendError::Core(e) => e,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -79,6 +113,78 @@ impl PgNoteRepo {
         &self.pool
     }
 
+    /// Copy the current row into `revisions` under its own version.
+    async fn keep_revision(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        cur: &NoteRow,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "INSERT INTO revisions (path, version, body, updated_at, updated_by) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(&cur.path)
+        .bind(cur.version)
+        .bind(&cur.body)
+        .bind(cur.updated_at)
+        .bind(&cur.updated_by)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// One `append` attempt in its own transaction: lock the row, then
+    /// either create it at one past the highest kept revision, or extend
+    /// its body (a newline in between unless the body is empty or already
+    /// ends with one) and bump the version.
+    async fn append_once(
+        &self,
+        path: &NotePath,
+        text: &str,
+        by: &str,
+    ) -> Result<Note, AppendError> {
+        let mut tx = self.pool.begin().await?;
+        let current: Option<NoteRow> = sqlx::query_as(
+            "SELECT path, body, version, updated_at, updated_by FROM notes WHERE path = $1 FOR UPDATE",
+        )
+        .bind(path.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row: NoteRow = match current {
+            None => sqlx::query_as(
+                "INSERT INTO notes (path, body, version, updated_by) \
+                 VALUES ($1, $2, (SELECT coalesce(max(version), 0) + 1 FROM revisions WHERE path = $1), $3) \
+                 RETURNING path, body, version, updated_at, updated_by",
+            )
+            .bind(path.as_str())
+            .bind(text)
+            .bind(by)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| match e.as_database_error() {
+                Some(d) if d.is_unique_violation() => AppendError::Exists,
+                _ => AppendError::Sql(e),
+            })?,
+            Some(cur) => {
+                let mut body = cur.body;
+                if !body.is_empty() && !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str(text);
+                sqlx::query_as(
+                    "UPDATE notes SET body = $2, version = version + 1, updated_at = now(), updated_by = $3 \
+                     WHERE path = $1 RETURNING path, body, version, updated_at, updated_by",
+                )
+                .bind(path.as_str())
+                .bind(&body)
+                .bind(by)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
+        tx.commit().await?;
+        row.into_note().map_err(AppendError::Core)
+    }
+
     fn push_prefix_and_cursor(qb: &mut QueryBuilder<Postgres>, prefix: &str, cursor: Option<&str>) {
         if !prefix.is_empty() {
             qb.push(" AND path LIKE ")
@@ -109,7 +215,7 @@ impl NoteRepo for PgNoteRepo {
         body: &str,
         expected: Option<i64>,
         by: &str,
-    ) -> Result<Note, CoreError> {
+    ) -> Result<PutResult, CoreError> {
         let mut tx = self.pool.begin().await?;
         let current: Option<NoteRow> = sqlx::query_as(
             "SELECT path, body, version, updated_at, updated_by FROM notes WHERE path = $1 FOR UPDATE",
@@ -134,9 +240,17 @@ impl NoteRepo for PgNoteRepo {
                     current: cur.version,
                 })
             }
+            (Some(_), Some(cur)) if cur.body == body => {
+                tx.commit().await?;
+                return Ok(PutResult {
+                    note: cur.into_note()?,
+                    changed: false,
+                });
+            }
             (None, None) => {
                 sqlx::query_as(
-                    "INSERT INTO notes (path, body, version, updated_by) VALUES ($1, $2, 1, $3) \
+                    "INSERT INTO notes (path, body, version, updated_by) \
+                     VALUES ($1, $2, (SELECT coalesce(max(version), 0) + 1 FROM revisions WHERE path = $1), $3) \
                      RETURNING path, body, version, updated_at, updated_by",
                 )
                 .bind(path.as_str())
@@ -146,17 +260,7 @@ impl NoteRepo for PgNoteRepo {
                 .await?
             }
             (Some(_), Some(cur)) => {
-                sqlx::query(
-                    "INSERT INTO revisions (path, version, body, updated_at, updated_by) \
-                     VALUES ($1, $2, $3, $4, $5)",
-                )
-                .bind(&cur.path)
-                .bind(cur.version)
-                .bind(&cur.body)
-                .bind(cur.updated_at)
-                .bind(&cur.updated_by)
-                .execute(&mut *tx)
-                .await?;
+                Self::keep_revision(&mut tx, &cur).await?;
                 sqlx::query_as(
                     "UPDATE notes SET body = $2, version = version + 1, updated_at = now(), updated_by = $3 \
                      WHERE path = $1 RETURNING path, body, version, updated_at, updated_by",
@@ -169,24 +273,59 @@ impl NoteRepo for PgNoteRepo {
             }
         };
         tx.commit().await?;
-        row.into_note()
+        Ok(PutResult {
+            note: row.into_note()?,
+            changed: true,
+        })
+    }
+
+    async fn delete(
+        &self,
+        path: &NotePath,
+        expected: Option<i64>,
+        _by: &str, // not recorded: the kept revision names the last writer
+    ) -> Result<Note, CoreError> {
+        let mut tx = self.pool.begin().await?;
+        let current: Option<NoteRow> = sqlx::query_as(
+            "SELECT path, body, version, updated_at, updated_by FROM notes WHERE path = $1 FOR UPDATE",
+        )
+        .bind(path.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(cur) = current else {
+            return Err(CoreError::NotFound(path.to_string()));
+        };
+        if let Some(e) = expected {
+            if cur.version != e {
+                return Err(CoreError::VersionConflict {
+                    path: path.to_string(),
+                    expected: Some(e),
+                    current: cur.version,
+                });
+            }
+        }
+        Self::keep_revision(&mut tx, &cur).await?;
+        sqlx::query("DELETE FROM notes WHERE path = $1")
+            .bind(path.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        cur.into_note()
     }
 
     async fn append(&self, path: &NotePath, text: &str, by: &str) -> Result<Note, CoreError> {
-        let row: NoteRow = sqlx::query_as(
-            "INSERT INTO notes (path, body, version, updated_by) VALUES ($1, $2, 1, $3) \
-             ON CONFLICT (path) DO UPDATE SET \
-               body = CASE WHEN notes.body = '' OR right(notes.body, 1) = E'\\n' \
-                           THEN notes.body ELSE notes.body || E'\\n' END || EXCLUDED.body, \
-               version = notes.version + 1, updated_at = now(), updated_by = EXCLUDED.updated_by \
-             RETURNING path, body, version, updated_at, updated_by",
-        )
-        .bind(path.as_str())
-        .bind(text)
-        .bind(by)
-        .fetch_one(&self.pool)
-        .await?;
-        row.into_note()
+        // A first append races another first append on the INSERT; the loser
+        // sees a unique violation, and on the retry the row exists and is
+        // locked like any other.
+        match self.append_once(path, text, by).await {
+            Err(AppendError::Exists) => match self.append_once(path, text, by).await {
+                Err(AppendError::Exists) => Err(CoreError::Storage(format!(
+                    "append to {path}: note created concurrently twice"
+                ))),
+                r => r.map_err(AppendError::into_core),
+            },
+            r => r.map_err(AppendError::into_core),
+        }
     }
 
     async fn list(
@@ -196,7 +335,7 @@ impl NoteRepo for PgNoteRepo {
         page: &Page,
     ) -> Result<PageOut<NoteMeta>, CoreError> {
         let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-            "SELECT path, version, updated_at, updated_by, length(body)::bigint AS size FROM notes WHERE TRUE",
+            "SELECT path, version, updated_at, updated_by, octet_length(body)::bigint AS size FROM notes WHERE TRUE",
         );
         Self::push_prefix_and_cursor(&mut qb, prefix, page.cursor.as_deref());
         for f in filters {
@@ -287,6 +426,32 @@ impl NoteRepo for PgNoteRepo {
                 })
             })
             .collect()
+    }
+
+    async fn history_meta(
+        &self,
+        path: &NotePath,
+        limit: u32,
+    ) -> Result<Vec<RevisionMeta>, CoreError> {
+        let rows = sqlx::query(
+            "SELECT path, version, updated_at, updated_by, octet_length(body)::bigint AS size \
+             FROM revisions WHERE path = $1 ORDER BY version DESC LIMIT $2",
+        )
+        .bind(path.as_str())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(RevisionMeta {
+                path: NotePath::parse(r.try_get::<String, _>("path")?.as_str())?,
+                version: r.try_get("version")?,
+                updated_at: r.try_get("updated_at")?,
+                updated_by: r.try_get("updated_by")?,
+                size: r.try_get("size")?,
+            });
+        }
+        Ok(out)
     }
 
     async fn dump(&self, prefix: &str, page: &Page) -> Result<PageOut<DumpEntry>, CoreError> {
