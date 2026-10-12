@@ -350,17 +350,21 @@ async fn children(svc: &NoteService, prefix: &str) -> Result<Children, CoreError
     Ok(out)
 }
 
-/// Links to `/ui/` and to every `/`-terminated ancestor of `path`.
+/// Links to `/ui/` and to every `/`-terminated ancestor of `path`. Each link
+/// shows only its own segment (`notelet / tasks / x`), the href is the full
+/// prefix.
 fn crumbs(path: &str) -> String {
     let mut out = String::from(r#"<nav><a href="/ui/">notelet</a>"#);
     let mut end = 0;
     while let Some(i) = path[end..].find('/') {
+        let start = end;
         end += i + 1;
         if end == path.len() {
             break;
         }
-        let p = escape(&path[..end]);
-        out.push_str(&format!(r#" / <a href="/ui/tree/{p}">{p}</a>"#));
+        let href = escape(&path[..end]);
+        let label = escape(&path[start..end - 1]);
+        out.push_str(&format!(r#" / <a href="/ui/tree/{href}">{label}</a>"#));
     }
     out.push_str("</nav>");
     out
@@ -716,8 +720,15 @@ mod tests {
     #[test]
     fn crumbs_link_every_ancestor() {
         let c = crumbs("projects/x/a.md");
-        assert!(c.contains(r#"href="/ui/tree/projects/""#), "{c}");
-        assert!(c.contains(r#"href="/ui/tree/projects/x/""#), "{c}");
+        assert!(
+            c.contains(r#"href="/ui/tree/projects/">projects</a>"#),
+            "{c}"
+        );
+        assert!(c.contains(r#"href="/ui/tree/projects/x/">x</a>"#), "{c}");
         assert!(!c.contains("a.md"), "{c}");
+        assert!(
+            !c.contains(">projects/x<"),
+            "label is the segment only: {c}"
+        );
     }
 }
