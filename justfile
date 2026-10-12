@@ -35,9 +35,9 @@ doc:
 
 # --- deploy: run by a human -------------------------------------------------
 
-# deploy the dev app (fly.dev.toml)
-deploy-dev:
-    fly deploy -c fly.dev.toml
+# deploy the dev app (fly.dev.toml); pass the app name when it differs from the toml
+deploy-dev app="notelet-dev":
+    fly deploy -c fly.dev.toml -a {{app}} --ha=false
 
 # deploy the production app (fly.toml)
 deploy:
