@@ -9,12 +9,13 @@ default:
 # fmt + clippy on both crates
 check:
     cargo fmt --all -- --check
-    cargo clippy -p notelet-core -p notelet-mcp --all-targets -- -D warnings
+    cargo clippy -p notelet-core -p notelet-mcp -p notelet --all-targets -- -D warnings
 
 # unit tests (no database)
 test:
     cargo test -p notelet-core
     cargo test -p notelet-mcp
+    cargo test -p notelet
 
 # Postgres integration test; needs NOTELET_TEST_DATABASE_URL
 test-pg:

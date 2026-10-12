@@ -28,11 +28,12 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy -p notelet-core -p notelet-mcp --all-targets -- -D warnings
+        run: cargo clippy -p notelet-core -p notelet-mcp -p notelet --all-targets -- -D warnings
       - name: test
         run: |
           cargo test -p notelet-core
           cargo test -p notelet-mcp
+          cargo test -p notelet
       - name: test (postgres)
         env:
           NOTELET_TEST_DATABASE_URL: postgres://notelet:notelet@localhost:5432/notelet_test

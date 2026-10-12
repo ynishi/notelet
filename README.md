@@ -89,6 +89,7 @@ bearer_token_env_var = "NOTELET_TOKEN"
 ## Layout
 
 ```
+crates/notelet        umbrella: re-exports notelet-core under the project name (depend on this from library code)
 crates/notelet-core   domain, port (NoteRepo), service, Postgres adapter, in-memory adapter, migrations
 crates/notelet-mcp    the binary: config from env, bearer middleware, rmcp tools + resources, HTTP / stdio
 ```

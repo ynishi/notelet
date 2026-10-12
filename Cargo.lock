@@ -1090,6 +1090,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "notelet"
+version = "0.1.0"
+dependencies = [
+ "notelet-core",
+]
+
+[[package]]
 name = "notelet-core"
 version = "0.1.0"
 dependencies = [

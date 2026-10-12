@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/notelet-core", "crates/notelet-mcp"]
+members = ["crates/notelet-core", "crates/notelet-mcp", "crates/notelet"]
 
 [workspace.package]
 version = "0.1.0"
