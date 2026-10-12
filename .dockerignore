@@ -1,0 +1,13 @@
+# Keep the Fly / Docker build context to the sources. Without this the local
+# target/ (gigabytes) is uploaded to the builder on every deploy.
+target/
+.git/
+.worktrees/
+.claude/
+.smoke/
+.sandbox-snapshots/
+.env
+.env.*
+!.env.example
+*.log
+.github/
