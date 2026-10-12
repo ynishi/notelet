@@ -1,0 +1,30 @@
+# Development app: the same image, a separate database, `NOTELET_ACTOR=dev`.
+# Local `just dev` runs point at this app's database so no local Postgres
+# or Docker is needed.
+app = "notelet-dev"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NOTELET_BIND = "0.0.0.0:8490"
+  NOTELET_ACTOR = "dev"
+  RUST_LOG = "debug"
+
+[http_service]
+  internal_port = 8490
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

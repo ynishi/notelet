@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["crates/notelet-core", "crates/notelet-mcp"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Yutaka Nishimura"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ynishi/notelet"
+homepage = "https://github.com/ynishi/notelet"
+documentation = "https://docs.rs/notelet-core"
+
+[workspace.dependencies]
+notelet-core = { path = "crates/notelet-core", version = "0.1.0" }
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

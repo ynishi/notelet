@@ -1,0 +1,72 @@
+//! # notelet-core
+//!
+//! The domain, ports and storage adapters of **notelet**: a deliberately thin,
+//! hosted store for Markdown notes that coding agents read and write over MCP.
+//!
+//! ## Why it exists
+//!
+//! Agents accumulate working state: journals, design drafts, private lists.
+//! Keeping that state as files inside a repository checkout leaks (an agent
+//! quotes a path or a paragraph into a public file) and scatters (every host,
+//! worktree and archive ends up with a different copy). Keeping it in a
+//! feature-rich knowledge tool costs more to maintain than the notes are
+//! worth. notelet is the minimum in between: a key-value store of Markdown
+//! bodies addressed by a path, with one lock, one history table, and a filter
+//! that is a thin wrapper over SQL.
+//!
+//! ## The model
+//!
+//! ```text
+//! Note        path -> body (Markdown), version, updated_at, updated_by
+//! Revision    the body a `put` replaced, keyed by (path, version)
+//! Filter      field (path | updated_at | updated_by) × op (eq ne like ilike gt lt gte lte) × value
+//! Page        limit (1..=1000) + keyset cursor (the last path of the previous page)
+//! ```
+//!
+//! Paths are slash-separated segments of `[A-Za-z0-9._-]`; the tree is only
+//! a naming convention (`projects/<repo>/journal.md`, `tasks/<task>/...`,
+//! `lists/<name>.md`), there is no directory object.
+//!
+//! ## Locking
+//!
+//! `put` is optimistic: the caller passes the version it last read; the store
+//! replaces the body only if that is still the current version, otherwise it
+//! answers [`CoreError::VersionConflict`] with the current version. There is
+//! no lease and no explicit lock. `append` needs no version at all: it adds a
+//! line to the end and cannot clobber anyone.
+//!
+//! ## Layout (lightweight DDD / Clean)
+//!
+//! | module | role |
+//! |---|---|
+//! | [`domain`] | value types and their validation; no I/O |
+//! | [`port`] | the [`port::NoteRepo`] trait the service depends on |
+//! | [`service`] | [`service::NoteService`]: validation, then one repo call |
+//! | [`pg`] | the Postgres adapter (sqlx); the only module that knows SQL |
+//! | [`memory`] | an in-memory adapter for tests and dry runs |
+//!
+//! Everything a transport (the MCP binary) needs is [`service::NoteService`];
+//! it never touches the repository directly.
+//!
+//! ## What is deliberately absent
+//!
+//! Tree structure, node types, properties, projections, snapshots, diffs,
+//! tags, a query language, full-text indexing, multiple tables, users.
+//! If a need for one of these appears, the answer is usually a path
+//! convention or a second small tool, not a feature here.
+
+pub mod domain;
+pub mod error;
+pub mod memory;
+pub mod pg;
+pub mod port;
+pub mod service;
+
+pub use domain::{
+    DumpEntry, Field, Filter, Note, NoteMeta, NotePath, Op, Page, PageOut, Revision, SearchHit,
+};
+pub use error::CoreError;
+pub use memory::MemoryNoteRepo;
+pub use pg::PgNoteRepo;
+pub use port::NoteRepo;
+pub use service::NoteService;

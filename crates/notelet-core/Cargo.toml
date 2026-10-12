@@ -1,0 +1,36 @@
+[package]
+name = "notelet-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "../../README.md"
+description = "Domain, ports and the Postgres adapter for notelet: a thin hosted Markdown note store with optimistic locking"
+keywords = ["notes", "markdown", "postgres", "mcp", "agent"]
+categories = ["database", "text-processing"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["sync"] }
+tracing = { workspace = true }
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls",
+    "migrate",
+    "macros",
+    "chrono",
+    "derive",
+] }
+
+[dev-dependencies]
+tokio = { workspace = true }

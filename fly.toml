@@ -1,0 +1,30 @@
+# Production app. Secrets (NOTELET_DATABASE_URL, NOTELET_TOKEN) are set with
+# `fly secrets set`, never here. The app name is a placeholder; the operator
+# renames it at deploy time.
+app = "notelet"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NOTELET_BIND = "0.0.0.0:8490"
+  NOTELET_ACTOR = "mcp"
+  RUST_LOG = "info"
+
+[http_service]
+  internal_port = 8490
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

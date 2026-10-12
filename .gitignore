@@ -1,0 +1,11 @@
+/target
+/.worktrees/
+/.claude/worktrees/
+/.smoke/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.swp
+/.sandbox-snapshots/
+/.fly-proxy.log

@@ -1,0 +1,42 @@
+[package]
+name = "notelet-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "../../README.md"
+description = "notelet as an MCP server: a thin hosted Markdown note store (Postgres, bearer auth, optimistic locking) for coding agents"
+keywords = ["mcp", "notes", "markdown", "postgres", "agent"]
+categories = ["command-line-utilities", "database"]
+
+[package.metadata.dist]
+formula = "notelet-mcp"
+
+[[bin]]
+name = "notelet-mcp"
+path = "src/main.rs"
+
+[dependencies]
+notelet-core = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+schemars = "1"
+clap = { version = "4", features = ["derive", "env"] }
+axum = "0.8"
+rmcp = { version = "3", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "transport-io",
+] }
+
+[dev-dependencies]
+notelet-core = { workspace = true }
