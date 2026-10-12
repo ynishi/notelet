@@ -11,9 +11,6 @@ All notable changes to this project are documented here. The format follows Keep
 - Shorten the notelet-mcp description so the Homebrew formula passes brew style
 - Add the notelet umbrella crate
 
-### Added
-- `notelet`: umbrella crate re-exporting `notelet-core` under the project name, so the name is held by a real crate and docs.rs carries the README.
-
 ## [0.1.0] - 2026-10-12
 
 ### Added
