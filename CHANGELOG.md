@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-12
+
 ### Added
 - `notelet-core`: `Note` / `Revision` / `Filter` / `Page` domain, `NoteRepo` port, `NoteService`, Postgres adapter with optimistic locking and revisions, in-memory adapter, embedded migrations.
 - `notelet-mcp`: streamable HTTP and stdio transports, bearer middleware, eight tools (`note_get`, `note_put`, `note_append`, `note_delete`, `note_list`, `note_search`, `note_history`, `note_dump`), three guide resources.
