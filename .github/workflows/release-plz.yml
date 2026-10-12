@@ -1,0 +1,84 @@
+name: Release-plz
+
+on:
+  workflow_dispatch:
+    inputs:
+      auto_merge:
+        description: "Merge the release PR automatically once its checks pass"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  # Opens the release PR (version bump + CHANGELOG) at the current HEAD. Runs only
+  # when dispatched by the repository owner; a push to main never opens one.
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner }}
+    permissions:
+      contents: read
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      # The release PR, its auto-merge and the tag are the App's, not a person's, and
+      # not GITHUB_TOKEN's: a PR or a push made with GITHUB_TOKEN triggers no workflow,
+      # so the PR's CI and the tag's release.yml would never run.
+      - id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - id: release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      # `--merge` (a merge commit), the method htl uses; the repository must allow it.
+      - name: Arm auto-merge on the release PR
+        if: ${{ inputs.auto_merge && steps.release-pr.outputs.prs != '[]' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PRS: ${{ steps.release-pr.outputs.prs }}
+        run: |
+          for n in $(echo "$PRS" | jq -r '.[].number'); do
+            gh pr merge "$n" --auto --merge
+          done
+
+  # Publishes notelet-core and notelet-mcp and pushes the v<version> tag when the
+  # release PR lands on main (release_always = false). The tag push fires release.yml
+  # (dist). crates.io is reached through Trusted Publishing: with no registry token in
+  # the environment, release-plz exchanges this job's OIDC token for a short-lived one.
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' && github.repository_owner == 'ynishi' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}

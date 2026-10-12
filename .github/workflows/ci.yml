@@ -37,6 +37,3 @@ jobs:
         env:
           NOTELET_TEST_DATABASE_URL: postgres://notelet:notelet@localhost:5432/notelet_test
         run: cargo test -p notelet-core --test pg -- --nocapture
-
-# release-plz (dispatched release PR + OIDC publish) and cargo-dist are added
-# when the crates are first published; see CONTRIBUTING.md "Releases".

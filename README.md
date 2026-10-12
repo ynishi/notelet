@@ -34,6 +34,22 @@ Bulk loading is not a tool: the operator runs `notelet-mcp import <dir> [--prefi
 
 The guides the server publishes as MCP resources (`notelet://guides/onboarding`, `locking`, `filters`) are the usage documentation; this README does not repeat them.
 
+## Install
+
+```sh
+cargo install notelet-mcp          # binary: notelet-mcp
+```
+
+Or a prebuilt binary from the [latest release](https://github.com/ynishi/notelet/releases/latest)
+— macOS (Apple Silicon, Intel), Linux (aarch64, x86_64) and Windows (x86_64). The
+installers put `notelet-mcp` in `$CARGO_HOME/bin`, where `cargo install` would:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ynishi/notelet/releases/latest/download/notelet-mcp-installer.sh | sh
+brew install ynishi/tap/notelet-mcp
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/ynishi/notelet/releases/latest/download/notelet-mcp-installer.ps1 | iex"
+```
+
 ## Run
 
 Requirements: a Postgres database. Local development points at a hosted dev database; there is no local Docker setup to maintain.

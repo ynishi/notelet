@@ -1,0 +1,67 @@
+# release-plz: the release PR and the publish that follows it.
+#
+# A release is cut in two steps, neither of them a local command. A dispatch of
+# `Release-plz` (.github/workflows/release-plz.yml) opens a release PR at the current
+# main: the version bump and the CHANGELOG. Merging that PR publishes the two crates
+# in dependency order (notelet-core, then notelet-mcp) and pushes the `v<version>` tag,
+# and that tag is what `Release` (cargo-dist, .github/workflows/release.yml) builds
+# binaries for.
+#
+# The next version is read from the commits since the last release. The workspace is on
+# 0.x, where release-plz would bump patch for everything short of a `!` breaking marker.
+# On 0.x the minor is the compatibility unit cargo resolves by, so a commit whose subject
+# starts with `feat:` asks for one, and so does a change to `notelet-core`'s public API;
+# anything else is a patch (CONTRIBUTING, "Releases"). `features_always_increment_minor`
+# is what makes `feat:` mean minor on 0.x. The commits are read per package, by the files
+# they touch: a `feat:` outside both crate directories changes nothing here.
+
+[workspace]
+semver_check = false
+features_always_increment_minor = true
+# Only notelet-mcp writes a changelog (below); notelet-core's commits are folded into it.
+changelog_update = false
+dependencies_update = false
+# The GitHub Release is created by cargo-dist (release.yml) from the tag, with the
+# binaries attached; release-plz only publishes and tags.
+git_release_enable = false
+git_tag_enable = false
+git_tag_name = "v{{ version }}"
+# Publish only when the commit that landed on main is the release PR's; an ordinary
+# merge never publishes.
+release_always = false
+pr_labels = ["release"]
+
+# The two crates move in lockstep through `[workspace.package] version`, so one crate is
+# enough to tag and to keep the single root CHANGELOG. `notelet-mcp` is that crate: it is
+# the one with a binary, so its tag is the one cargo-dist releases. `notelet-core`'s
+# commits are folded into its changelog through `changelog_include`.
+#
+# A package belongs in `changelog_include` once it is on crates.io: an unpublished
+# package has no last release for release-plz to count from, so it reads the whole
+# history. notelet-core 0.1.0 is published by hand before the first dispatch (Trusted
+# Publishing cannot create a crate; docs/release-setup.md), so it is listed from the
+# start.
+[[package]]
+name = "notelet-mcp"
+git_tag_enable = true
+changelog_update = true
+changelog_path = "./CHANGELOG.md"
+changelog_include = ["notelet-core"]
+
+# Changelog grouping. `commit_parsers` replaces release-plz's defaults rather than
+# extending them, so adding one rule means restating the seven it ships with. The added
+# rule, first so it wins, skips merge commits: a merged pull request's subject is
+# `Merge pull request #N ...` and says nothing the branch's own commits do not. The next
+# version is not read from these rules (it comes from every commit's message), so a
+# skipped commit still counts there.
+[changelog]
+commit_parsers = [
+  { message = "^Merge ", skip = true },
+  { message = "^feat", group = "added" },
+  { message = "^changed", group = "changed" },
+  { message = "^deprecated", group = "deprecated" },
+  { message = "^removed", group = "removed" },
+  { message = "^fix", group = "fixed" },
+  { message = "^security", group = "security" },
+  { message = "^.*", group = "other" },
+]
