@@ -46,7 +46,7 @@ name = "notelet-mcp"
 git_tag_enable = true
 changelog_update = true
 changelog_path = "./CHANGELOG.md"
-changelog_include = ["notelet-core"]
+changelog_include = ["notelet-core", "notelet"]
 
 # Changelog grouping. `commit_parsers` replaces release-plz's defaults rather than
 # extending them, so adding one rule means restating the seven it ships with. The added
