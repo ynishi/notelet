@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/notelet-core", "crates/notelet-mcp", "crates/notelet"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Yutaka Nishimura"]
@@ -13,7 +13,7 @@ homepage = "https://github.com/ynishi/notelet"
 documentation = "https://docs.rs/notelet-core"
 
 [workspace.dependencies]
-notelet-core = { path = "crates/notelet-core", version = "0.1.1" }
+notelet-core = { path = "crates/notelet-core", version = "0.2.0" }
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

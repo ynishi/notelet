@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/ynishi/notelet/compare/v0.1.1...v0.2.0) - 2026-10-13
+
+### Added
+
+- keep the cause in CoreError and log through tracing instead of eprintln
+- add tail_lines and max_bytes to note_get for reading the end of a note
+- read-only browser view at /ui with HTTP Basic auth
+
+### Fixed
+
+- breadcrumb links show only their own segment; deploy-dev takes the app name
+- loopback Host check on /ui without a token, plus boundary tests
+
 ## [0.1.1](https://github.com/ynishi/notelet/compare/v0.1.0...v0.1.1) - 2026-10-12
 
 ### Other
