@@ -11,10 +11,12 @@
 //! | `/ui/note/{path}` | the note's body rendered from Markdown (see [`crate::render`]), with version, updated_at and size |
 //! | `/ui/search?q=&prefix=` | `search(q, prefix)` hits with snippets; an empty `q` shows only the form |
 //!
-//! Access: when a token is configured, every `/ui` request needs HTTP Basic
-//! with that token as the password (any user name); otherwise `401` with
-//! `WWW-Authenticate: Basic realm="notelet", charset="UTF-8"`. Without a
-//! token (loopback binds only, see [`crate::config`]) there is no
+//! Access: when tokens are configured, every `/ui` request needs HTTP Basic
+//! with any listed token as the password (any user name; the same table as
+//! `/mcp`, see [`crate::auth`]); otherwise `401` with
+//! `WWW-Authenticate: Basic realm="notelet", charset="UTF-8"`. The view is
+//! read-only, so which token was used does not matter here. Without tokens
+//! (loopback binds only, see [`crate::config`]) there is no
 //! credential, so the view accepts only a loopback `Host` (see
 //! [`loopback_host`]) and answers `403` to anything else, the same guard
 //! against DNS rebinding that `/mcp` gets from rmcp's `allowed_hosts`.
@@ -40,6 +42,7 @@ use axum::{
 use notelet_core::{CoreError, NoteService};
 use serde::Deserialize;
 
+use crate::auth::TokenTable;
 use crate::render::{escape, markdown, query_value};
 
 /// Prefixes always offered on `/ui/`, whether or not anything is under them
@@ -57,10 +60,10 @@ struct Ui {
     svc: Arc<NoteService>,
 }
 
-/// The `/ui` routes, with Basic auth in front when `token` is set and a
-/// loopback-`Host` check in front when it is not. Merge it into the HTTP
+/// The `/ui` routes, with Basic auth in front when `tokens` is non-empty and
+/// a loopback-`Host` check in front when it is empty. Merge it into the HTTP
 /// router; it owns its full paths.
-pub fn router(svc: Arc<NoteService>, token: Option<String>) -> Router {
+pub fn router(svc: Arc<NoteService>, tokens: TokenTable) -> Router {
     let mut r = Router::new()
         .route("/ui", get(index))
         .route("/ui/", get(index))
@@ -68,12 +71,12 @@ pub fn router(svc: Arc<NoteService>, token: Option<String>) -> Router {
         .route("/ui/note/{*path}", get(note))
         .route("/ui/search", get(search))
         .with_state(Ui { svc });
-    if let Some(token) = token {
-        let token: Arc<str> = Arc::from(token);
+    if !tokens.is_empty() {
+        let tokens = Arc::new(tokens);
         r = r.layer(axum::middleware::from_fn(
             move |req: Request, next: Next| {
-                let token = Arc::clone(&token);
-                async move { require_basic(token, req, next).await }
+                let tokens = Arc::clone(&tokens);
+                async move { require_basic(tokens, req, next).await }
             },
         ));
     } else {
@@ -128,8 +131,8 @@ pub(crate) fn loopback_host(value: &str) -> bool {
         .any(|ok| host.eq_ignore_ascii_case(ok))
 }
 
-async fn require_basic(token: Arc<str>, req: Request, next: Next) -> Response {
-    if crate::auth::basic_matches(req.headers(), &token) {
+async fn require_basic(tokens: Arc<TokenTable>, req: Request, next: Next) -> Response {
+    if crate::auth::basic_actor(req.headers(), &tokens).is_some() {
         next.run(req).await
     } else {
         (
@@ -455,7 +458,11 @@ mod tests {
         svc.put("projects/x/b.md", "other", None, "t")
             .await
             .unwrap();
-        router(svc, token.map(str::to_string))
+        let mut tokens = TokenTable::default();
+        if let Some(t) = token {
+            tokens.insert(crate::auth::digest(t), crate::auth::Actor::new("tester"));
+        }
+        router(svc, tokens)
     }
 
     async fn call(app: Router, uri: &str, auth: Option<&str>) -> (StatusCode, String, Response) {
@@ -652,7 +659,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (s, body, _) = call(router(svc, None), "/ui/note/n/x.md", None).await;
+        let (s, body, _) = call(router(svc, TokenTable::default()), "/ui/note/n/x.md", None).await;
         assert_eq!(s, StatusCode::OK);
         assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
         assert!(body.contains("&lt;script&gt;alert(2)"), "{body}");
@@ -665,7 +672,12 @@ mod tests {
         svc.put("n/s.md", "if a <b> needle </b> c\n", None, "t")
             .await
             .unwrap();
-        let (s, body, _) = call(router(svc, None), "/ui/search?q=needle", None).await;
+        let (s, body, _) = call(
+            router(svc, TokenTable::default()),
+            "/ui/search?q=needle",
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::OK);
         assert!(body.contains(r#"href="/ui/note/n/s.md""#), "{body}");
         assert!(body.contains("&lt;b&gt;"), "{body}");
@@ -696,7 +708,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let app = router(svc, None);
+        let app = router(svc, TokenTable::default());
 
         let (s, body, _) = call(app.clone(), "/ui/tree/p/", None).await;
         assert_eq!(s, StatusCode::OK);

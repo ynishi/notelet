@@ -56,7 +56,8 @@ Requirements: a Postgres database. Local development points at a hosted dev data
 
 ```sh
 export NOTELET_DATABASE_URL=postgres://...      # or DATABASE_URL
-export NOTELET_TOKEN=...                        # or NOTELET_TOKEN_FILE=~/.notelet/token
+export NOTELET_TOKEN=...                        # one shared token; or NOTELET_TOKEN_FILE=~/.notelet/token
+export NOTELET_TOKENS_FILE=~/.notelet/tokens    # one token per client (below); or NOTELET_TOKENS="alice:<sha256> bob:<sha256>"
 export NOTELET_BIND=127.0.0.1:8490              # default; non-loopback requires a token
 export RUST_LOG=info                            # log level; default info
 notelet-mcp serve                               # streamable HTTP at /mcp, /healthz open
@@ -64,7 +65,18 @@ notelet-mcp stdio                               # one local client over stdin/st
 notelet-mcp migrate                             # apply migrations and exit
 notelet-mcp import ./notes --prefix projects/x  # file tree -> notes (--dry-run to preview)
 notelet-mcp export ./backup                     # notes -> file tree
+notelet-mcp token alice                         # new token for a client + its NOTELET_TOKENS entry (no database needed)
 ```
+
+### One token per client
+
+`updated_by` records which credential authenticated a write. The identity is the token: no users table, no tool or header to declare a name. Give each client its own token and map it to an actor name:
+
+1. `notelet-mcp token alice` prints two lines. The `token` (`nlt_` and 64 hex digits) goes to the client (its `Authorization: Bearer`, see below); the `entry` line, `alice:<sha256 of the token>`, goes to the server.
+2. The server reads entries from `NOTELET_TOKENS` or, if `NOTELET_TOKENS_FILE` is set, from that file (it wins). Entries are separated by any whitespace; a line starting with `#` is a comment, in the file and in the variable alike, and a leading BOM is ignored. Pasting a token (`nlt_...`) instead of its digest is refused at startup. The server stores digests, never tokens. An actor (also `NOTELET_ACTOR`) is `[A-Za-z0-9._-]{1,64}`; a digest listed twice stops the server at startup.
+3. Rotate by adding a second entry for the same actor, moving the client to the new token, then removing the old entry. Revoke by removing the entry and restarting: the list is read once at startup.
+
+The single `NOTELET_TOKEN` / `NOTELET_TOKEN_FILE` still works and joins the same table, written as `NOTELET_ACTOR` (default `mcp`); `NOTELET_ACTOR` is also the actor for `stdio`, `import` and a loopback `serve` without tokens. Clients that share one token are indistinguishable in `updated_by`. `note_delete` records no actor: the kept revision names the last writer.
 
 Migrations are embedded and applied on start.
 
@@ -100,7 +112,7 @@ bearer_token_env_var = "NOTELET_TOKEN"
 | `/ui/note/<path>` | the note rendered from Markdown, with version, updated_at and size |
 | `/ui/search?q=&prefix=` | `note_search` hits with snippets |
 
-When a token is configured, the browser asks for HTTP Basic credentials: any user name, the token as the password (compared in constant time; a failure is `401` with `WWW-Authenticate: Basic realm="notelet", charset="UTF-8"`). Without a token (loopback binds only) there is no credential, so both `/mcp` and `/ui` accept only a loopback `Host` value (`localhost`, `127.0.0.1` or `[::1]`, any port) and answer `403` otherwise. `/mcp` keeps its bearer check and `/healthz` stays open.
+When tokens are configured, the browser asks for HTTP Basic credentials: any user name, any listed token as the password (looked up by its sha256 digest; a failure is `401` with `WWW-Authenticate: Basic realm="notelet", charset="UTF-8"`). Without tokens (loopback binds only) there is no credential, so both `/mcp` and `/ui` accept only a loopback `Host` value (`localhost`, `127.0.0.1` or `[::1]`, any port) and answer `403` otherwise. `/mcp` keeps its bearer check and `/healthz` stays open.
 
 The view is a projection, not part of the model: it calls the same `get` / `list` / `search` the tools do, has no route that writes, and adds no tool. Raw HTML in a note is shown as text, links keep only `http`, `https`, `mailto` or relative URLs, images are shown as links rather than loaded, pages carry no script and no external asset, and every page is sent with `Cache-Control: no-store`.
 

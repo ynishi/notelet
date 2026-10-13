@@ -1,4 +1,5 @@
-# Production app. Secrets (NOTELET_DATABASE_URL, NOTELET_TOKEN) are set with
+# Production app. Secrets (NOTELET_DATABASE_URL, NOTELET_TOKEN, or NOTELET_TOKENS
+# for one token per client) are set with
 # `fly secrets set`, never here. The app name is a placeholder; the operator
 # renames it at deploy time.
 app = "notelet"

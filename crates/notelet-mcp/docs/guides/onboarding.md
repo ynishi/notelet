@@ -54,4 +54,6 @@ Its tools do not render, link, or structure notes. It does not know about users.
 It does not search with a query language or an index. If you need any of
 those, build them next to notelet on top of `note_dump`, not inside it.
 
-A human can read the store in a browser at `/ui/` on `serve` (read-only, HTTP Basic with the token as the password); it is a projection for people, not a tool, so agents keep using the tools above.
+A human can read the store in a browser at `/ui/` on `serve` (read-only, HTTP Basic with a token as the password); it is a projection for people, not a tool, so agents keep using the tools above.
+
+`note_put` and `note_append` record `updated_by`: the actor of the token the client authenticated with (one token per client, chosen by the operator), or the server's fallback name when the server runs without tokens or over stdio. You cannot set it yourself, and two clients sharing one token look the same. `note_delete` keeps the last writer's revision and does not name who deleted.
