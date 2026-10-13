@@ -8,6 +8,14 @@
 //! `expected_version` on a conflict) so an agent can act on them without
 //! parsing prose. An `Internal` failure is logged at `error` with its cause
 //! chain and a domain error at `debug`.
+//!
+//! The `updated_by` of a write is the actor of the credential that
+//! authenticated the request ([`crate::auth`]): [`crate::auth::require_bearer`]
+//! leaves it in the HTTP request, rmcp hands the request parts to the tool
+//! through its extensions, and `note_put` / `note_append` / `note_delete`
+//! read it per call (and record it as the `actor` field of their span). A
+//! call with no such actor, i.e. over stdio or on a loopback `serve`
+//! without tokens, writes as the configured fallback (`NOTELET_ACTOR`).
 
 use std::sync::Arc;
 
@@ -15,7 +23,7 @@ use notelet_core::service::{FilterInput, History};
 use notelet_core::{CoreError, NoteService, WriteOutcome};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ListResourcesResult, PaginatedRequestParams,
+    CallToolResult, ContentBlock, Extensions, ListResourcesResult, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
@@ -24,10 +32,12 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use serde::Deserialize;
 
+use crate::auth::{Actor, TokenTable};
 use crate::config::Config;
 use crate::resources;
 
-/// The server: a service handle and the actor name written to `updated_by`.
+/// The server: a service handle and the fallback actor written to
+/// `updated_by` when the request carries no authenticated actor.
 #[derive(Clone)]
 pub struct NoteletMcp {
     svc: Arc<NoteService>,
@@ -215,6 +225,18 @@ impl NoteletMcp {
         Self { svc, actor }
     }
 
+    /// The actor of this call: the one [`crate::auth::require_bearer`] put in
+    /// the HTTP request (rmcp keeps the request parts in the extensions), or
+    /// the fallback when there is none. Recorded on the current span.
+    fn actor_of(&self, ext: &Extensions) -> String {
+        let actor = ext
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Actor>())
+            .map_or(self.actor.as_str(), Actor::as_str);
+        tracing::Span::current().record("actor", actor);
+        actor.to_string()
+    }
+
     #[tool(
         description = "Read one note: path, body (Markdown), version, updated_at, updated_by, size, truncated. Optional tail_lines (>= 1) returns only the last N lines and max_bytes (>= 1) caps the bytes returned, cut on a line start where possible; use them to read the end of a long journal. size is the whole body in bytes (as note_list reports it) and truncated=true means body is only the end of the note. Keep the version if you intend to note_put, but NEVER note_put a body returned with truncated=true: it would replace the whole note with the fragment (to add to a journal use note_append)."
     )]
@@ -232,14 +254,16 @@ impl NoteletMcp {
     #[tool(
         description = "Create or replace a note's whole body with optimistic locking. Omit expected_version to create (fails with kind=Conflict if it exists); pass the version you read to replace (fails with kind=Conflict and current_version if someone wrote in between — re-read, merge, retry). The replaced body is kept in history. A body identical to the current one changes nothing (changed=false). Returns path, version, updated_at, size (bytes, UTF-8), sha256, changed."
     )]
-    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_put", path = %p.path))]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_put", path = %p.path, actor = tracing::field::Empty))]
     async fn note_put(
         &self,
         Parameters(p): Parameters<PutParams>,
+        ext: Extensions,
     ) -> Result<CallToolResult, McpError> {
+        let actor = self.actor_of(&ext);
         write_json(
             self.svc
-                .put(&p.path, &p.body, p.expected_version, &self.actor)
+                .put(&p.path, &p.body, p.expected_version, &actor)
                 .await,
         )
     }
@@ -247,27 +271,27 @@ impl NoteletMcp {
     #[tool(
         description = "Append text to the end of a note (created if missing), on its own line. No version needed: an append cannot overwrite anyone. Use this for journals; it is also the way to upload a large body in chunks: the first append creates the note. Returns path, version, updated_at, size (bytes, UTF-8), sha256, changed."
     )]
-    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_append", path = %p.path))]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_append", path = %p.path, actor = tracing::field::Empty))]
     async fn note_append(
         &self,
         Parameters(p): Parameters<AppendParams>,
+        ext: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        write_json(self.svc.append(&p.path, &p.text, &self.actor).await)
+        let actor = self.actor_of(&ext);
+        write_json(self.svc.append(&p.path, &p.text, &actor).await)
     }
 
     #[tool(
         description = "Remove a note. Its body stays readable through note_history as the last revision. Pass expected_version to refuse if someone wrote in between; omit it to delete whatever is there. Answers the removed note's version, size and sha256."
     )]
-    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_delete", path = %p.path))]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_delete", path = %p.path, actor = tracing::field::Empty))]
     async fn note_delete(
         &self,
         Parameters(p): Parameters<DeleteParams>,
+        ext: Extensions,
     ) -> Result<CallToolResult, McpError> {
-        write_json(
-            self.svc
-                .delete(&p.path, p.expected_version, &self.actor)
-                .await,
-        )
+        let actor = self.actor_of(&ext);
+        write_json(self.svc.delete(&p.path, p.expected_version, &actor).await)
     }
 
     #[tool(
@@ -396,16 +420,17 @@ pub async fn run_stdio(svc: Arc<NoteService>, actor: String) -> anyhow::Result<(
     Ok(())
 }
 
-/// Serve over streamable HTTP at `/mcp`, with `/healthz` open, bearer
-/// required on `/mcp` when a token is configured. The read-only browser view
-/// ([`crate::ui`]) is merged in under `/ui`, behind HTTP Basic with the same
-/// token.
+/// Serve over streamable HTTP at `/mcp`, with `/healthz` open, a listed
+/// bearer token required on `/mcp` when any token is configured. The
+/// read-only browser view ([`crate::ui`]) is merged in under `/ui`, behind
+/// HTTP Basic with the same tokens.
 pub async fn run_http(svc: Arc<NoteService>, cfg: Config) -> anyhow::Result<()> {
     let router = build_router(svc, &cfg);
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(
         bind = %cfg.bind,
-        auth = if cfg.token.is_some() { "bearer" } else { "none (loopback)" },
+        auth = if cfg.tokens.is_empty() { "none (loopback)" } else { "bearer" },
+        tokens = cfg.tokens.len(),
         "serving notelet MCP at /mcp, read-only view at /ui/"
     );
     axum::serve(listener, router).await?;
@@ -413,12 +438,12 @@ pub async fn run_http(svc: Arc<NoteService>, cfg: Config) -> anyhow::Result<()> 
 }
 
 /// The full HTTP router `run_http` serves: `/healthz` (open), `/mcp`
-/// (bearer when a token is set) and `/ui` (Basic when a token is set,
-/// loopback `Host` only otherwise). Split out so tests can drive it without
-/// binding a socket.
+/// (bearer when tokens are set, which also selects the write actor) and
+/// `/ui` (Basic when tokens are set, loopback `Host` only otherwise). Split
+/// out so tests can drive it without binding a socket.
 pub(crate) fn build_router(svc: Arc<NoteService>, cfg: &Config) -> axum::Router {
     let actor = cfg.actor.clone();
-    let ui = crate::ui::router(svc.clone(), cfg.token.clone());
+    let ui = crate::ui::router(svc.clone(), cfg.tokens.clone());
     let mut http_config = StreamableHttpServerConfig::default();
     http_config.json_response = true;
     if !cfg.bind.ip().is_loopback() {
@@ -432,12 +457,12 @@ pub(crate) fn build_router(svc: Arc<NoteService>, cfg: &Config) -> axum::Router 
     );
 
     let mut mcp_router = axum::Router::new().nest_service("/mcp", mcp);
-    if let Some(token) = cfg.token.clone() {
-        let token: Arc<str> = Arc::from(token);
+    if !cfg.tokens.is_empty() {
+        let tokens: Arc<TokenTable> = Arc::new(cfg.tokens.clone());
         mcp_router = mcp_router.layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let token = Arc::clone(&token);
-                async move { crate::auth::require_bearer(token, req, next).await }
+                let tokens = Arc::clone(&tokens);
+                async move { crate::auth::require_bearer(tokens, req, next).await }
             },
         ));
     }
@@ -479,21 +504,27 @@ mod tests {
     async fn put_conflict_is_a_machine_readable_error() {
         let s = server();
         let ok = s
-            .note_put(Parameters(PutParams {
-                path: "projects/x/a.md".into(),
-                body: "one".into(),
-                expected_version: None,
-            }))
+            .note_put(
+                Parameters(PutParams {
+                    path: "projects/x/a.md".into(),
+                    body: "one".into(),
+                    expected_version: None,
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap();
         assert_ne!(ok.is_error, Some(true));
 
         let conflict = s
-            .note_put(Parameters(PutParams {
-                path: "projects/x/a.md".into(),
-                body: "two".into(),
-                expected_version: Some(9),
-            }))
+            .note_put(
+                Parameters(PutParams {
+                    path: "projects/x/a.md".into(),
+                    body: "two".into(),
+                    expected_version: Some(9),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(conflict.is_error, Some(true));
@@ -502,21 +533,27 @@ mod tests {
         assert_eq!(body["current_version"], 1);
         assert_eq!(body["expected_version"], 9);
 
-        let create_again = s
-            .note_put(put("projects/x/a.md", "two", None))
-            .await
-            .unwrap();
+        let create_again = put_note(&s, "projects/x/a.md", "two", None).await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&text_of(&create_again)).unwrap();
         assert_eq!(body["kind"], "Conflict");
         assert!(body["expected_version"].is_null());
     }
 
-    fn put(path: &str, body: &str, expected_version: Option<i64>) -> Parameters<PutParams> {
-        Parameters(PutParams {
-            path: path.into(),
-            body: body.into(),
-            expected_version,
-        })
+    async fn put_note(
+        s: &NoteletMcp,
+        path: &str,
+        body: &str,
+        expected_version: Option<i64>,
+    ) -> Result<CallToolResult, McpError> {
+        s.note_put(
+            Parameters(PutParams {
+                path: path.into(),
+                body: body.into(),
+                expected_version,
+            }),
+            Extensions::default(),
+        )
+        .await
     }
 
     fn json_of(r: &CallToolResult) -> serde_json::Value {
@@ -531,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn put_reports_sha256_and_changed() {
         let s = server();
-        let w = json_of(&s.note_put(put("n/a.md", "héllo", None)).await.unwrap());
+        let w = json_of(&put_note(&s, "n/a.md", "héllo", None).await.unwrap());
         assert_eq!(w["version"], 1);
         assert_eq!(w["changed"], true);
         assert_eq!(w["size"], 6);
@@ -544,8 +581,8 @@ mod tests {
     #[tokio::test]
     async fn put_same_body_reports_unchanged() {
         let s = server();
-        s.note_put(put("n/a.md", "same", None)).await.unwrap();
-        let w = json_of(&s.note_put(put("n/a.md", "same", Some(1))).await.unwrap());
+        put_note(&s, "n/a.md", "same", None).await.unwrap();
+        let w = json_of(&put_note(&s, "n/a.md", "same", Some(1)).await.unwrap());
         assert_eq!(w["changed"], false);
         assert_eq!(w["version"], 1);
     }
@@ -553,12 +590,15 @@ mod tests {
     #[tokio::test]
     async fn delete_then_get_is_not_found_and_history_keeps_it() {
         let s = server();
-        s.note_put(put("n/d.md", "bye", None)).await.unwrap();
+        put_note(&s, "n/d.md", "bye", None).await.unwrap();
         let w = json_of(
-            &s.note_delete(Parameters(DeleteParams {
-                path: "n/d.md".into(),
-                expected_version: Some(1),
-            }))
+            &s.note_delete(
+                Parameters(DeleteParams {
+                    path: "n/d.md".into(),
+                    expected_version: Some(1),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap(),
         );
@@ -599,9 +639,7 @@ mod tests {
     #[tokio::test]
     async fn get_tail_through_the_tool() {
         let s = server();
-        s.note_put(put("n/j.md", "l1\nl2\nl3\n", None))
-            .await
-            .unwrap();
+        put_note(&s, "n/j.md", "l1\nl2\nl3\n", None).await.unwrap();
 
         let whole = json_of(&s.note_get(get("n/j.md", None, None)).await.unwrap());
         assert_eq!(whole["body"], "l1\nl2\nl3\n");
@@ -623,7 +661,7 @@ mod tests {
     #[tokio::test]
     async fn get_tail_zero_is_validation() {
         let s = server();
-        s.note_put(put("n/j.md", "x\n", None)).await.unwrap();
+        put_note(&s, "n/j.md", "x\n", None).await.unwrap();
         for (l, m) in [(Some(0), None), (None, Some(0))] {
             let r = s.note_get(get("n/j.md", l, m)).await.unwrap();
             assert_eq!(r.is_error, Some(true));
@@ -652,10 +690,13 @@ mod tests {
     async fn append_then_list_and_search() {
         let s = server();
         for line in ["alpha", "beta"] {
-            s.note_append(Parameters(AppendParams {
-                path: "projects/x/journal.md".into(),
-                text: line.into(),
-            }))
+            s.note_append(
+                Parameters(AppendParams {
+                    path: "projects/x/journal.md".into(),
+                    text: line.into(),
+                }),
+                Extensions::default(),
+            )
             .await
             .unwrap();
         }
@@ -705,24 +746,37 @@ mod tests {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+    use crate::auth::digest;
     use axum::body::Body;
     use axum::http::{header, Request, StatusCode};
     use notelet_core::MemoryNoteRepo;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     const TOKEN: &str = "secret";
     // base64("anyone:secret")
     const BASIC_GOOD: &str = "Basic YW55b25lOnNlY3JldA==";
 
-    fn app() -> axum::Router {
-        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
-        let cfg = Config {
+    fn config(entries: &[(&str, &str)]) -> Config {
+        let mut tokens = TokenTable::default();
+        for (token, actor) in entries {
+            assert!(tokens.insert(digest(token), Actor::new(actor)));
+        }
+        Config {
             database_url: String::new(),
-            token: Some(TOKEN.into()),
+            tokens,
             bind: "127.0.0.1:0".parse().unwrap(),
-            actor: "test".into(),
-        };
-        build_router(svc, &cfg)
+            actor: "fallback".into(),
+        }
+    }
+
+    fn app_with(entries: &[(&str, &str)]) -> (axum::Router, Arc<NoteService>) {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        (build_router(svc.clone(), &config(entries)), svc)
+    }
+
+    fn app() -> axum::Router {
+        app_with(&[(TOKEN, "test")]).0
     }
 
     async fn status(method: &str, uri: &str, auth: Option<&str>) -> StatusCode {
@@ -765,5 +819,281 @@ mod boundary_tests {
             status("GET", "/ui/", Some(BASIC_GOOD)).await,
             StatusCode::OK
         );
+    }
+
+    /// One JSON-RPC POST to `/mcp` with `token`; answers the status, the
+    /// session id header if any, and the JSON body (`null` when empty).
+    async fn rpc(
+        app: &axum::Router,
+        token: &str,
+        session: Option<&str>,
+        body: Value,
+    ) -> (StatusCode, Option<String>, Value) {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(sid) = session {
+            req = req.header("mcp-session-id", sid);
+            req = req.header("mcp-protocol-version", "2025-11-25");
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let sid = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, sid, value)
+    }
+
+    /// Open an MCP session with `token` (initialize + initialized).
+    async fn open_session(app: &axum::Router, token: &str) -> String {
+        let (st, sid, init) = rpc(
+            app,
+            token,
+            None,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{init}");
+        let sid = sid.expect("session id");
+        let (st, _, _) = rpc(
+            app,
+            token,
+            Some(&sid),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        sid
+    }
+
+    async fn call_tool(
+        app: &axum::Router,
+        token: &str,
+        sid: &str,
+        id: u64,
+        name: &str,
+        args: Value,
+    ) -> Value {
+        let (st, _, v) = rpc(
+            app,
+            token,
+            Some(sid),
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                   "params": {"name": name, "arguments": args}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_ne!(v["result"]["isError"], true, "{v}");
+        v
+    }
+
+    async fn updated_by(svc: &NoteService, path: &str) -> String {
+        svc.read(path, None, None).await.unwrap().updated_by
+    }
+
+    #[tokio::test]
+    async fn updated_by_is_the_actor_of_the_token_on_each_write() {
+        let (app, svc) = app_with(&[("token-a", "alice"), ("token-b", "bob")]);
+        let a = open_session(&app, "token-a").await;
+        let b = open_session(&app, "token-b").await;
+
+        call_tool(
+            &app,
+            "token-a",
+            &a,
+            2,
+            "note_put",
+            json!({"path": "n/put.md", "body": "x"}),
+        )
+        .await;
+        call_tool(
+            &app,
+            "token-b",
+            &b,
+            2,
+            "note_put",
+            json!({"path": "n/put-b.md", "body": "x"}),
+        )
+        .await;
+        assert_eq!(updated_by(&svc, "n/put.md").await, "alice");
+        assert_eq!(updated_by(&svc, "n/put-b.md").await, "bob");
+
+        // the actor follows the credential of each request, not the session:
+        // bob appends to alice's note over alice's session id.
+        call_tool(
+            &app,
+            "token-b",
+            &a,
+            3,
+            "note_append",
+            json!({"path": "n/put.md", "text": "y"}),
+        )
+        .await;
+        assert_eq!(updated_by(&svc, "n/put.md").await, "bob");
+        call_tool(
+            &app,
+            "token-a",
+            &a,
+            4,
+            "note_append",
+            json!({"path": "n/app.md", "text": "y"}),
+        )
+        .await;
+        assert_eq!(updated_by(&svc, "n/app.md").await, "alice");
+
+        // core does not record who deleted: the kept revision carries the
+        // last writer (alice); delete's actor is only on the span (see below)
+        call_tool(
+            &app,
+            "token-b",
+            &b,
+            3,
+            "note_delete",
+            json!({"path": "n/app.md"}),
+        )
+        .await;
+        let hist = svc.history("n/app.md", None, false).await.unwrap();
+        let notelet_core::service::History::Meta(revs) = hist else {
+            panic!("meta history expected")
+        };
+        assert_eq!(revs[0].updated_by, "alice");
+    }
+
+    /// Records the `actor` field of every span it sees.
+    #[derive(Clone, Default)]
+    struct ActorSpy(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ActorSpy {
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct V<'a>(&'a ActorSpy);
+            impl tracing::field::Visit for V<'_> {
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    if f.name() == "actor" {
+                        self.0 .0.lock().unwrap().push(v.to_string());
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            values.record(&mut V(self));
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_actor_is_recorded_on_the_span() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let spy = ActorSpy::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(spy.clone()));
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        svc.put("n/d.md", "x", None, "alice").await.unwrap();
+        let s = NoteletMcp::new(svc, "fallback".into());
+        let mut ext = Extensions::default();
+        ext.insert(
+            Request::builder()
+                .extension(Actor::new("bob"))
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0,
+        );
+        s.note_delete(
+            Parameters(DeleteParams {
+                path: "n/d.md".into(),
+                expected_version: None,
+            }),
+            ext,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*spy.0.lock().unwrap(), vec!["bob".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn unknown_token_is_401_and_writes_nothing() {
+        let (app, svc) = app_with(&[("token-a", "alice")]);
+        let sid = open_session(&app, "token-a").await;
+        let (st, _, _) = rpc(
+            &app,
+            "token-evil",
+            Some(&sid),
+            json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": "note_put",
+                              "arguments": {"path": "n/x.md", "body": "x"}}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        assert!(svc.read("n/x.md", None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_single_token_writes_as_the_fallback_actor() {
+        // what `from_env` builds for NOTELET_TOKEN alone (see config tests)
+        let (app, svc) = app_with(&[("legacy", "fallback")]);
+        let sid = open_session(&app, "legacy").await;
+        call_tool(
+            &app,
+            "legacy",
+            &sid,
+            2,
+            "note_put",
+            json!({"path": "n/l.md", "body": "x"}),
+        )
+        .await;
+        assert_eq!(updated_by(&svc, "n/l.md").await, "fallback");
+    }
+
+    #[tokio::test]
+    async fn without_http_parts_the_fallback_actor_is_used() {
+        // stdio, and a tokenless loopback `serve`: nothing in the extensions
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        let s = NoteletMcp::new(svc.clone(), "fallback".into());
+        s.note_put(
+            Parameters(PutParams {
+                path: "n/s.md".into(),
+                body: "x".into(),
+                expected_version: None,
+            }),
+            Extensions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated_by(&svc, "n/s.md").await, "fallback");
+
+        // parts present but no actor (the middleware did not run)
+        let mut ext = Extensions::default();
+        ext.insert(Request::builder().body(()).unwrap().into_parts().0);
+        s.note_append(
+            Parameters(AppendParams {
+                path: "n/s.md".into(),
+                text: "y".into(),
+            }),
+            ext,
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated_by(&svc, "n/s.md").await, "fallback");
     }
 }

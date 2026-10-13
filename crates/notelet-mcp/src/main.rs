@@ -6,16 +6,19 @@
 //! notelet-mcp migrate   # apply migrations and exit
 //! notelet-mcp import <dir> [--prefix <p>] [--dry-run]   # file tree -> notes (operator)
 //! notelet-mcp export <dir> [--prefix <p>]               # notes -> file tree (operator)
+//! notelet-mcp token <actor>                             # new bearer token + its NOTELET_TOKENS entry
 //! ```
 //!
-//! Configuration is environment only (see [`config`]): a database URL, a
-//! bearer token, a bind address, an actor name. There is no config file,
+//! Configuration is environment only (see [`config`]): a database URL,
+//! bearer tokens (each mapped to the actor it writes as), a bind address, a
+//! fallback actor name. There is no config file,
 //! because the host (Fly, systemd, a shell) already has a way to set
 //! environment variables and a second mechanism would have to be kept in
 //! agreement with it.
 //!
 //! The server itself lives in [`server`]; the bundled guides in
-//! [`resources`]; bearer checking in [`auth`]; the operator's bulk
+//! [`resources`]; token lookup and the per-token actor in [`auth`]; the
+//! operator's bulk
 //! `import` / `export` (not MCP tools) in [`transfer`]; the read-only
 //! browser view (`/ui`, HTTP Basic, no writes) in [`ui`], rendering through
 //! [`render`].
@@ -65,6 +68,12 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Make a bearer token for ACTOR and print it with its NOTELET_TOKENS entry
+    /// (needs no database).
+    Token {
+        /// Name written to `updated_by` by this token: `[A-Za-z0-9._-]{1,64}`.
+        actor: String,
+    },
     /// Write every note (under --prefix) to DIR as a file tree.
     Export {
         /// Destination directory (created as needed).
@@ -92,6 +101,31 @@ fn extra_directives(raw: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// A fresh token: `nlt_` and 32 random bytes from the operating system, as hex.
+fn new_token() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no system randomness: {e}"))?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{}{hex}", auth::TOKEN_PREFIX))
+}
+
+/// `notelet-mcp token <actor>`: print the token for the client and the line
+/// for the server's `NOTELET_TOKENS` (the token itself is never stored).
+fn print_token(actor: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        auth::valid_actor(actor),
+        "actor must match [A-Za-z0-9._-]{{1,64}}"
+    );
+    let token = new_token()?;
+    let hex: String = auth::digest(&token)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    println!("token (give to the client, keep secret): {token}");
+    println!("entry (add to NOTELET_TOKENS or NOTELET_TOKENS_FILE): {actor}:{hex}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // stderr only: stdout is the protocol channel in stdio mode, and a
@@ -115,6 +149,9 @@ async fn main() -> anyhow::Result<()> {
         .try_init();
 
     let cli = Cli::parse();
+    if let Some(Cmd::Token { actor }) = &cli.cmd {
+        return print_token(actor);
+    }
     let cfg = Config::from_env()?;
 
     let repo = PgNoteRepo::connect(&cfg.database_url).await?;
@@ -150,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{summary}");
             Ok(())
         }
+        Cmd::Token { .. } => unreachable!("handled before the database is opened"),
         Cmd::Serve => {
             repo.migrate().await?;
             let svc = Arc::new(NoteService::new(Arc::new(repo)));
@@ -160,7 +198,16 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::extra_directives;
+    use super::{extra_directives, new_token};
+
+    #[test]
+    fn tokens_are_prefixed_hex_and_differ() {
+        let (a, b) = (new_token().unwrap(), new_token().unwrap());
+        let hex = a.strip_prefix("nlt_").expect("prefix");
+        assert_eq!(hex.len(), 64);
+        assert!(hex.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn both_held_by_default() {
