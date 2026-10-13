@@ -10,3 +10,9 @@ This repository is public. Everything in it is readable by anyone.
 - Pushing, releasing, deploying and opening pull requests are done by a human. `just deploy*` recipes exist for that human.
 
 Read `CONTRIBUTING.md` and `PUBLIC_DEVELOPMENT.md` before changing anything.
+
+## Who does what in an agent session
+
+- Implementation goes to a Sonnet subagent on a topic branch. The main session hands it the spec (the draft written for the issue), the files it may touch, and the verify commands (`just check`, `just test`); it does not implement in the main context.
+- Review goes to an Opus subagent that reads the diff against the spec and reports findings; it does not edit. Findings go back to the implementer, not to the main context's own editor.
+- The main session integrates: it writes the draft, dispatches, relays findings, and reports. Commits, pushes and pull requests stay with the human as above.
