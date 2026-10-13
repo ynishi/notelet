@@ -385,7 +385,7 @@ fn error_page(e: CoreError) -> Response {
             (StatusCode::BAD_REQUEST, e.to_string())
         }
         _ => {
-            tracing::error!(error = %e, "ui request failed");
+            tracing::error!(error = %e.chain(), "ui request failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
         }
     };

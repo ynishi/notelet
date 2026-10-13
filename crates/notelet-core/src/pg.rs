@@ -57,9 +57,11 @@ impl From<sqlx::Error> for AppendError {
 }
 
 impl AppendError {
-    fn into_core(self) -> CoreError {
+    fn into_core(self, path: &NotePath) -> CoreError {
         match self {
-            AppendError::Exists => CoreError::Storage("append: note created concurrently".into()),
+            AppendError::Exists => CoreError::Contended {
+                path: path.to_string(),
+            },
             AppendError::Sql(e) => e.into(),
             AppendError::Core(e) => e,
         }
@@ -323,12 +325,12 @@ impl NoteRepo for PgNoteRepo {
         // locked like any other.
         match self.append_once(path, text, by).await {
             Err(AppendError::Exists) => match self.append_once(path, text, by).await {
-                Err(AppendError::Exists) => Err(CoreError::Storage(format!(
-                    "append to {path}: note created concurrently twice"
-                ))),
-                r => r.map_err(AppendError::into_core),
+                Err(AppendError::Exists) => Err(CoreError::Contended {
+                    path: path.to_string(),
+                }),
+                r => r.map_err(|e| e.into_core(path)),
             },
-            r => r.map_err(AppendError::into_core),
+            r => r.map_err(|e| e.into_core(path)),
         }
     }
 

@@ -6,7 +6,8 @@
 //! Domain errors come back as a failed tool result carrying
 //! `{ "kind": ..., "message": ... }` (and `current_version` /
 //! `expected_version` on a conflict) so an agent can act on them without
-//! parsing prose.
+//! parsing prose. An `Internal` failure is logged at `error` with its cause
+//! chain and a domain error at `debug`.
 
 use std::sync::Arc;
 
@@ -169,9 +170,15 @@ fn core_error(err: CoreError) -> CallToolResult {
             "Validation"
         }
         CoreError::VersionConflict { .. } => "Conflict",
-        CoreError::Storage(_) => "Internal",
+        CoreError::Contended { .. } | CoreError::Storage(_) => "Internal",
+        _ => "Internal",
     };
-    let mut body = serde_json::json!({ "kind": kind, "message": err.to_string() });
+    if kind == "Internal" {
+        tracing::error!(kind, error = %err.chain(), "tool failed");
+    } else {
+        tracing::debug!(kind, error = %err, "tool rejected");
+    }
+    let mut body = serde_json::json!({ "kind": kind, "message": err.chain().to_string() });
     if let (
         CoreError::VersionConflict {
             expected, current, ..
@@ -211,6 +218,7 @@ impl NoteletMcp {
     #[tool(
         description = "Read one note: path, body (Markdown), version, updated_at, updated_by, size, truncated. Optional tail_lines (>= 1) returns only the last N lines and max_bytes (>= 1) caps the bytes returned, cut on a line start where possible; use them to read the end of a long journal. size is the whole body in bytes (as note_list reports it) and truncated=true means body is only the end of the note. Keep the version if you intend to note_put, but NEVER note_put a body returned with truncated=true: it would replace the whole note with the fragment (to add to a journal use note_append)."
     )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_get", path = %p.path))]
     async fn note_get(
         &self,
         Parameters(p): Parameters<GetParams>,
@@ -224,6 +232,7 @@ impl NoteletMcp {
     #[tool(
         description = "Create or replace a note's whole body with optimistic locking. Omit expected_version to create (fails with kind=Conflict if it exists); pass the version you read to replace (fails with kind=Conflict and current_version if someone wrote in between — re-read, merge, retry). The replaced body is kept in history. A body identical to the current one changes nothing (changed=false). Returns path, version, updated_at, size (bytes, UTF-8), sha256, changed."
     )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_put", path = %p.path))]
     async fn note_put(
         &self,
         Parameters(p): Parameters<PutParams>,
@@ -238,6 +247,7 @@ impl NoteletMcp {
     #[tool(
         description = "Append text to the end of a note (created if missing), on its own line. No version needed: an append cannot overwrite anyone. Use this for journals; it is also the way to upload a large body in chunks: the first append creates the note. Returns path, version, updated_at, size (bytes, UTF-8), sha256, changed."
     )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_append", path = %p.path))]
     async fn note_append(
         &self,
         Parameters(p): Parameters<AppendParams>,
@@ -248,6 +258,7 @@ impl NoteletMcp {
     #[tool(
         description = "Remove a note. Its body stays readable through note_history as the last revision. Pass expected_version to refuse if someone wrote in between; omit it to delete whatever is there. Answers the removed note's version, size and sha256."
     )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_delete", path = %p.path))]
     async fn note_delete(
         &self,
         Parameters(p): Parameters<DeleteParams>,
@@ -262,6 +273,7 @@ impl NoteletMcp {
     #[tool(
         description = "List notes (path, version, updated_at, updated_by, size in bytes (UTF-8); no body) under a prefix, filtered by ANDed predicates {field, op, value}. Fields: path, updated_at, updated_by. Ops: eq ne like ilike gt lt gte lte. Ordered by path; pass next_cursor as cursor to page (exclusive: the page starts strictly after that path). Default 100, max 1000. See notelet://guides/filters."
     )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_list", prefix = ?p.prefix))]
     async fn note_list(
         &self,
         Parameters(p): Parameters<ListParams>,
@@ -279,6 +291,7 @@ impl NoteletMcp {
     #[tool(
         description = "Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. Returns path, a snippet around the first hit, updated_at. Ordered by path; paged by next_cursor (exclusive: the page starts strictly after that path)."
     )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_search", prefix = ?p.prefix))]
     async fn note_search(
         &self,
         Parameters(p): Parameters<SearchParams>,
@@ -296,6 +309,7 @@ impl NoteletMcp {
     #[tool(
         description = "Bodies that note_put replaced or note_delete removed for this path, newest first (default 20, max 50). Appends do not create history. include_body=false returns only path, version, updated_at, updated_by, size (bytes, UTF-8)."
     )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_history", path = %p.path))]
     async fn note_history(
         &self,
         Parameters(p): Parameters<HistoryParams>,
@@ -314,6 +328,7 @@ impl NoteletMcp {
     #[tool(
         description = "Paths and full bodies under a prefix, ordered by path and paged: default 20, max 100 (bodies are heavy); pass next_cursor as cursor (exclusive). For backups, exports, or leaving notelet: the result is a file tree."
     )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_dump", prefix = ?p.prefix))]
     async fn note_dump(
         &self,
         Parameters(p): Parameters<DumpParams>,
@@ -440,6 +455,16 @@ mod tests {
     fn server() -> NoteletMcp {
         let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
         NoteletMcp::new(svc, "test".into())
+    }
+
+    #[test]
+    fn storage_error_is_internal_and_carries_the_cause() {
+        let r = core_error(CoreError::Storage(Box::new(std::io::Error::other(
+            "db down",
+        ))));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(body["kind"], "Internal");
+        assert!(body["message"].as_str().unwrap().contains("db down"));
     }
 
     fn text_of(r: &CallToolResult) -> String {
