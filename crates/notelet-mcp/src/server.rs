@@ -39,9 +39,15 @@ pub struct NoteletMcp {
 
 /// `note_get` input.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PathParams {
+pub struct GetParams {
     /// Note path, e.g. `projects/x/journal.md`.
     pub path: String,
+    /// Return only the last N lines (at least 1). A single trailing newline is not counted.
+    #[schemars(range(min = 1))]
+    pub tail_lines: Option<u32>,
+    /// Return at most this many bytes of the end (at least 1), starting on a line when possible.
+    #[schemars(range(min = 1))]
+    pub max_bytes: Option<u32>,
 }
 
 /// `note_put` input.
@@ -159,7 +165,9 @@ fn write_json(r: Result<WriteOutcome, CoreError>) -> Result<CallToolResult, McpE
 fn core_error(err: CoreError) -> CallToolResult {
     let kind = match &err {
         CoreError::NotFound(_) => "NotFound",
-        CoreError::InvalidPath(_) | CoreError::InvalidFilter(_) => "Validation",
+        CoreError::InvalidPath(_) | CoreError::InvalidFilter(_) | CoreError::InvalidTail(_) => {
+            "Validation"
+        }
         CoreError::VersionConflict { .. } => "Conflict",
         CoreError::Storage(_) => "Internal",
     };
@@ -201,13 +209,13 @@ impl NoteletMcp {
     }
 
     #[tool(
-        description = "Read one note: path, body (Markdown), version, updated_at, updated_by. Keep the version if you intend to note_put."
+        description = "Read one note: path, body (Markdown), version, updated_at, updated_by, size, truncated. Optional tail_lines (>= 1) returns only the last N lines and max_bytes (>= 1) caps the bytes returned, cut on a line start where possible; use them to read the end of a long journal. size is the whole body in bytes (as note_list reports it) and truncated=true means body is only the end of the note. Keep the version if you intend to note_put, but NEVER note_put a body returned with truncated=true: it would replace the whole note with the fragment (to add to a journal use note_append)."
     )]
     async fn note_get(
         &self,
-        Parameters(p): Parameters<PathParams>,
+        Parameters(p): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.svc.get(&p.path).await {
+        match self.svc.read(&p.path, p.tail_lines, p.max_bytes).await {
             Ok(n) => ok_json(&n),
             Err(e) => Ok(core_error(e)),
         }
@@ -531,8 +539,10 @@ mod tests {
         );
         assert_eq!(w["version"], 1);
         let r = s
-            .note_get(Parameters(PathParams {
+            .note_get(Parameters(GetParams {
                 path: "n/d.md".into(),
+                tail_lines: None,
+                max_bytes: None,
             }))
             .await
             .unwrap();
@@ -553,12 +563,58 @@ mod tests {
         assert!(h[0].get("body").is_none());
     }
 
+    fn get(path: &str, tail_lines: Option<u32>, max_bytes: Option<u32>) -> Parameters<GetParams> {
+        Parameters(GetParams {
+            path: path.into(),
+            tail_lines,
+            max_bytes,
+        })
+    }
+
+    #[tokio::test]
+    async fn get_tail_through_the_tool() {
+        let s = server();
+        s.note_put(put("n/j.md", "l1\nl2\nl3\n", None))
+            .await
+            .unwrap();
+
+        let whole = json_of(&s.note_get(get("n/j.md", None, None)).await.unwrap());
+        assert_eq!(whole["body"], "l1\nl2\nl3\n");
+        assert_eq!(whole["size"], 9);
+        assert_eq!(whole["truncated"], false);
+
+        let r = s.note_get(get("n/j.md", Some(2), None)).await.unwrap();
+        let t = json_of(&r);
+        assert_eq!(t["body"], "l2\nl3\n");
+        assert_eq!(t["size"], 9);
+        assert_eq!(t["truncated"], true);
+        assert_eq!(t["version"], 1);
+
+        let c = json_of(&s.note_get(get("n/j.md", Some(3), Some(4))).await.unwrap());
+        assert_eq!(c["body"], "l3\n");
+        assert_eq!(c["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn get_tail_zero_is_validation() {
+        let s = server();
+        s.note_put(put("n/j.md", "x\n", None)).await.unwrap();
+        for (l, m) in [(Some(0), None), (None, Some(0))] {
+            let r = s.note_get(get("n/j.md", l, m)).await.unwrap();
+            assert_eq!(r.is_error, Some(true));
+            let body: serde_json::Value = serde_json::from_str(&text_of(&r)).unwrap();
+            assert_eq!(body["kind"], "Validation");
+        }
+    }
+
     #[tokio::test]
     async fn invalid_path_is_validation() {
         let s = server();
         let r = s
-            .note_get(Parameters(PathParams {
+            .note_get(Parameters(GetParams {
                 path: "../etc".into(),
+                tail_lines: None,
+                max_bytes: None,
             }))
             .await
             .unwrap();

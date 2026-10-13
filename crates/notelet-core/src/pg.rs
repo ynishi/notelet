@@ -30,8 +30,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
 use crate::domain::{
-    escape_like, DumpEntry, Filter, FilterValue, Note, NoteMeta, NotePath, Page, PageOut, Revision,
-    RevisionMeta, SearchHit,
+    escape_like, DumpEntry, Filter, FilterValue, Note, NoteMeta, NotePath, NoteView, Page, PageOut,
+    Revision, RevisionMeta, SearchHit, Tail,
 };
 use crate::error::CoreError;
 use crate::port::{NoteRepo, PutResult};
@@ -207,6 +207,10 @@ impl NoteRepo for PgNoteRepo {
         .fetch_optional(&self.pool)
         .await?;
         row.map(NoteRow::into_note).transpose()
+    }
+
+    async fn get_view(&self, path: &NotePath, tail: &Tail) -> Result<Option<NoteView>, CoreError> {
+        Ok(self.get(path).await?.map(|note| NoteView::of(note, tail)))
     }
 
     async fn put(

@@ -155,6 +155,147 @@ impl WriteOutcome {
     }
 }
 
+/// How much of a note's body a read returns: the last `lines` lines, then
+/// at most `max_bytes` bytes of that. Either bound may be absent; with
+/// neither, the whole body. Both must be at least 1 when given.
+///
+/// `lines` selects and `max_bytes` caps. The cut is [`tail_start`], a pure
+/// function, so every adapter and transport cuts identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Tail {
+    lines: Option<u32>,
+    max_bytes: Option<u32>,
+}
+
+impl Tail {
+    /// Validate the two bounds; a zero is [`CoreError::InvalidTail`].
+    pub fn new(lines: Option<u32>, max_bytes: Option<u32>) -> Result<Self, CoreError> {
+        if lines == Some(0) {
+            return Err(CoreError::InvalidTail(
+                "tail_lines must be at least 1".into(),
+            ));
+        }
+        if max_bytes == Some(0) {
+            return Err(CoreError::InvalidTail(
+                "max_bytes must be at least 1".into(),
+            ));
+        }
+        Ok(Self { lines, max_bytes })
+    }
+
+    /// The whole body (no bound).
+    pub fn whole() -> Self {
+        Self::default()
+    }
+
+    /// The line bound, if any.
+    pub fn lines(&self) -> Option<u32> {
+        self.lines
+    }
+
+    /// The byte bound, if any.
+    pub fn max_bytes(&self) -> Option<u32> {
+        self.max_bytes
+    }
+}
+
+/// The byte offset in `body` where the part selected by `tail` starts
+/// (`0` = the whole body). Always a char boundary.
+///
+/// 1. `lines = L`: one trailing `\n` is not counted, so `"a\nb\nc\n"` with
+///    `L = 1` starts at `"c\n"`. The start is the byte just after the L-th
+///    `\n` counted from the end; with fewer than L newlines it is `0`.
+/// 2. `max_bytes = M`, when what remains is longer than M: let `s = n - M`.
+///    If `s` is `0` or the byte before it is `\n`, the window already starts
+///    on a line and `s` is kept. Otherwise `s` moves to just after the first
+///    `\n` at or after it, provided that is still inside the body. With no
+///    such `\n`, or only the body's last byte, the window is the end of one
+///    line longer than M and `s` moves to the next char boundary instead, so
+///    the result is valid UTF-8 but begins mid-line. A non-empty body
+///    yields a non-empty result unless `max_bytes` is smaller than the UTF-8
+///    width of the body's last character, in which case the result is empty
+///    (and `truncated`).
+pub fn tail_start(body: &str, tail: &Tail) -> usize {
+    let bytes = body.as_bytes();
+    let n = bytes.len();
+    let mut start = 0;
+    if let Some(lines) = tail.lines {
+        let end = if bytes.last() == Some(&b'\n') {
+            n - 1
+        } else {
+            n
+        };
+        let mut seen = 0u32;
+        for i in (0..end).rev() {
+            if bytes[i] == b'\n' {
+                seen += 1;
+                if seen == lines {
+                    start = i + 1;
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(max) = tail.max_bytes {
+        let max = max as usize;
+        if n - start > max {
+            let mut s = n - max;
+            if s > 0 && bytes[s - 1] != b'\n' {
+                match bytes[s..].iter().position(|&b| b == b'\n') {
+                    Some(off) if s + off + 1 < n => s += off + 1,
+                    _ => {
+                        while !body.is_char_boundary(s) {
+                            s += 1;
+                        }
+                    }
+                }
+            }
+            start = s;
+        }
+    }
+    start
+}
+
+/// A note as a read returns it: the body may be a tail (see [`Tail`]).
+/// `size` is the byte length of the **whole** body (the number `note_list`
+/// reports) and `truncated` says the body is only its end. A truncated
+/// body must never be written back with `put`: it would replace the whole
+/// note with the fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteView {
+    pub path: NotePath,
+    pub body: String,
+    pub version: i64,
+    pub updated_at: DateTime<Utc>,
+    pub updated_by: String,
+    /// Body length in bytes (UTF-8) of the whole note, not of `body`.
+    pub size: i64,
+    /// `true` when `body` is only the end of the note.
+    pub truncated: bool,
+}
+
+impl NoteView {
+    /// View `note` through `tail`.
+    pub fn of(note: Note, tail: &Tail) -> Self {
+        let size = note.body.len() as i64;
+        let start = tail_start(&note.body, tail);
+        let body = if start == 0 {
+            note.body
+        } else {
+            note.body[start..].to_string()
+        };
+        Self {
+            path: note.path,
+            body,
+            version: note.version,
+            updated_at: note.updated_at,
+            updated_by: note.updated_by,
+            size,
+            truncated: start > 0,
+        }
+    }
+}
+
 /// A revision without its body, for `history` when bodies are not wanted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevisionMeta {
@@ -421,6 +562,125 @@ pub fn normalize_append(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tail(l: Option<u32>, m: Option<u32>) -> Tail {
+        Tail::new(l, m).unwrap()
+    }
+
+    fn cut(body: &str, l: Option<u32>, m: Option<u32>) -> &str {
+        &body[tail_start(body, &tail(l, m))..]
+    }
+
+    #[test]
+    fn tail_rejects_zero() {
+        assert!(matches!(
+            Tail::new(Some(0), None),
+            Err(CoreError::InvalidTail(_))
+        ));
+        assert!(matches!(
+            Tail::new(None, Some(0)),
+            Err(CoreError::InvalidTail(_))
+        ));
+        assert!(Tail::new(Some(1), Some(1)).is_ok());
+    }
+
+    #[test]
+    fn tail_without_bounds_is_whole() {
+        assert_eq!(cut("a\nb\n", None, None), "a\nb\n");
+        assert_eq!(cut("", Some(3), Some(3)), "");
+    }
+
+    #[test]
+    fn tail_lines_ignores_one_trailing_newline() {
+        let b = "a\nb\nc\n";
+        assert_eq!(cut(b, Some(1), None), "c\n");
+        assert_eq!(cut(b, Some(2), None), "b\nc\n");
+        assert_eq!(cut("a\nb\nc", Some(1), None), "c");
+        // a blank last line counts as a line
+        assert_eq!(cut("a\nb\n\n", Some(1), None), "\n");
+    }
+
+    #[test]
+    fn tail_lines_larger_than_line_count_is_whole() {
+        assert_eq!(cut("a\nb\nc\n", Some(3), None), "a\nb\nc\n");
+        assert_eq!(cut("a\nb\nc\n", Some(99), None), "a\nb\nc\n");
+        assert_eq!(cut("single", Some(2), None), "single");
+    }
+
+    #[test]
+    fn tail_max_bytes_larger_than_body_is_whole() {
+        assert_eq!(cut("a\nb\n", None, Some(100)), "a\nb\n");
+        assert_eq!(cut("a\nb\n", None, Some(4)), "a\nb\n");
+    }
+
+    #[test]
+    fn tail_max_bytes_starts_on_a_line() {
+        let b = "aaa\nbb\nccc\n";
+        assert_eq!(b.len(), 11);
+        // s = 7 starts "ccc": the window already starts on a line
+        assert_eq!(cut(b, None, Some(4)), "ccc\n");
+        // s = 6 and s = 5 are mid-line; skip to the next line start
+        assert_eq!(cut(b, None, Some(5)), "ccc\n");
+        assert_eq!(cut(b, None, Some(6)), "ccc\n");
+        // s = 4 starts "bb": kept
+        assert_eq!(cut(b, None, Some(7)), "bb\nccc\n");
+        // s = 3 is the newline ending "aaa": skip past it to "bb"
+        assert_eq!(cut(b, None, Some(8)), "bb\nccc\n");
+    }
+
+    #[test]
+    fn tail_ascii_body_is_never_empty() {
+        let b = "aaa\nbb\nccc\n";
+        // one line longer than M: char-boundary fallback
+        assert_eq!(cut(b, None, Some(3)), "cc\n");
+        assert_eq!(cut(b, None, Some(1)), "\n");
+        for m in 1..=11 {
+            assert!(!cut(b, None, Some(m)).is_empty(), "m={m}");
+        }
+    }
+
+    #[test]
+    fn tail_one_line_longer_than_cap_falls_back_to_char_boundary() {
+        // "é" is 2 bytes; a cap of 3 bytes lands inside the first "é" of "ééé"
+        let b = "ééé";
+        assert_eq!(b.len(), 6);
+        assert_eq!(cut(b, None, Some(3)), "é");
+        assert_eq!(cut(b, None, Some(4)), "éé");
+        assert_eq!(cut(b, None, Some(1)), "");
+        // multibyte text with a newline near the cut
+        let m = "日本\n語語語";
+        assert_eq!(cut(m, None, Some(10)), "語語語");
+    }
+
+    #[test]
+    fn tail_both_bounds_together() {
+        let b = "l1\nl2\nl3\nl4\n";
+        // lines selects "l3\nl4\n" (6 bytes); the cap then trims to the last line
+        assert_eq!(cut(b, Some(2), Some(100)), "l3\nl4\n");
+        assert_eq!(cut(b, Some(2), Some(5)), "l4\n");
+        // cap larger than the line selection changes nothing
+        assert_eq!(cut(b, Some(1), Some(100)), "l4\n");
+    }
+
+    #[test]
+    fn note_view_reports_whole_size_and_truncation() {
+        let note = Note {
+            path: NotePath::parse("n/a.md").unwrap(),
+            body: "a\nb\nc\n".into(),
+            version: 3,
+            updated_at: Utc::now(),
+            updated_by: "t".into(),
+        };
+        let whole = NoteView::of(note.clone(), &Tail::whole());
+        assert_eq!(whole.body, "a\nb\nc\n");
+        assert!(!whole.truncated);
+        assert_eq!(whole.size, 6);
+        let t = NoteView::of(note, &tail(Some(1), None));
+        assert_eq!(t.body, "c\n");
+        assert!(t.truncated);
+        assert_eq!(t.size, 6);
+        assert_eq!(t.version, 3);
+    }
 
     #[test]
     fn path_accepts_tree_like_names() {

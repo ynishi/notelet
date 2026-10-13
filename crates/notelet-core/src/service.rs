@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use crate::domain::{
-    normalize_append, validate_prefix, DumpEntry, Filter, Note, NoteMeta, NotePath, Page, PageOut,
-    Revision, RevisionMeta, SearchHit, WriteOutcome,
+    normalize_append, validate_prefix, DumpEntry, Filter, Note, NoteMeta, NotePath, NoteView, Page,
+    PageOut, Revision, RevisionMeta, SearchHit, Tail, WriteOutcome,
 };
 use crate::error::CoreError;
 use crate::port::NoteRepo;
@@ -44,6 +44,25 @@ impl NoteService {
         let path = NotePath::parse(path)?;
         self.repo
             .get(&path)
+            .await?
+            .ok_or_else(|| CoreError::NotFound(path.into_string()))
+    }
+
+    /// Read one note, optionally only its end: `tail_lines` selects the
+    /// last lines and `max_bytes` caps what is returned (see [`Tail`]; a
+    /// zero for either is [`CoreError::InvalidTail`]). The view carries the
+    /// whole body's `size` and `truncated`; a truncated body must not be
+    /// written back with `put`.
+    pub async fn read(
+        &self,
+        path: &str,
+        tail_lines: Option<u32>,
+        max_bytes: Option<u32>,
+    ) -> Result<NoteView, CoreError> {
+        let path = NotePath::parse(path)?;
+        let tail = Tail::new(tail_lines, max_bytes)?;
+        self.repo
+            .get_view(&path, &tail)
             .await?
             .ok_or_else(|| CoreError::NotFound(path.into_string()))
     }
@@ -169,6 +188,41 @@ mod tests {
             op: op.into(),
             value: value.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn read_whole_tail_and_validation() {
+        let s = svc();
+        s.put("n/j.md", "l1\nl2\nl3\n", None, "t").await.unwrap();
+
+        let whole = s.read("n/j.md", None, None).await.unwrap();
+        assert_eq!(whole.body, "l1\nl2\nl3\n");
+        assert!(!whole.truncated);
+        assert_eq!(whole.size, 9);
+
+        let t = s.read("n/j.md", Some(1), None).await.unwrap();
+        assert_eq!(t.body, "l3\n");
+        assert!(t.truncated);
+        assert_eq!(t.size, 9);
+        assert_eq!(t.version, 1);
+
+        let c = s.read("n/j.md", Some(3), Some(4)).await.unwrap();
+        assert_eq!(c.body, "l3\n");
+
+        for (l, m) in [(Some(0), None), (None, Some(0))] {
+            assert!(matches!(
+                s.read("n/j.md", l, m).await.unwrap_err(),
+                CoreError::InvalidTail(_)
+            ));
+        }
+        assert!(matches!(
+            s.read("n/none.md", Some(1), None).await.unwrap_err(),
+            CoreError::NotFound(_)
+        ));
+        assert!(matches!(
+            s.read("../x", None, None).await.unwrap_err(),
+            CoreError::InvalidPath(_)
+        ));
     }
 
     #[tokio::test]

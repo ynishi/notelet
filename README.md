@@ -19,7 +19,7 @@ Paths are slash-separated segments of `[A-Za-z0-9._-]`; the tree (`projects/<rep
 
 | tool | does |
 |---|---|
-| `note_get` | read one note with its version |
+| `note_get` | read one note with its version; `tail_lines` / `max_bytes` read only its end (`size`, `truncated` say it is partial) |
 | `note_put` | create or replace the whole body; `expected_version` must match or you get `Conflict` with `current_version`; an identical body is a no-op (`changed: false`) |
 | `note_append` | add a line at the end, no version needed (journals, or uploading a large body in chunks) |
 | `note_delete` | remove a note; its body stays readable through `note_history` |

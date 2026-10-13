@@ -30,6 +30,11 @@ pub enum CoreError {
     #[error("invalid filter: {0}")]
     InvalidFilter(String),
 
+    /// A tail read was asked for zero lines or zero bytes (`tail_lines` and
+    /// `max_bytes` must each be at least 1 when given).
+    #[error("invalid tail: {0}")]
+    InvalidTail(String),
+
     /// The storage adapter failed. The message is the adapter's own.
     #[error("storage: {0}")]
     Storage(String),

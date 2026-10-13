@@ -12,7 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::domain::{
-    DumpEntry, Filter, Note, NoteMeta, NotePath, Page, PageOut, Revision, RevisionMeta, SearchHit,
+    DumpEntry, Filter, Note, NoteMeta, NotePath, NoteView, Page, PageOut, Revision, RevisionMeta,
+    SearchHit, Tail,
 };
 use crate::error::CoreError;
 
@@ -30,6 +31,12 @@ pub struct PutResult {
 pub trait NoteRepo: Send + Sync {
     /// The note at `path`, if any.
     async fn get(&self, path: &NotePath) -> Result<Option<Note>, CoreError>;
+
+    /// The note at `path` as a read returns it: [`NoteView`], whose body is
+    /// cut by `tail` (see [`Tail`]; [`Tail::whole`] for all of it). The same
+    /// fetch as [`NoteRepo::get`]; the cut happens in
+    /// [`NoteView::of`], so adapters cannot disagree about it.
+    async fn get_view(&self, path: &NotePath, tail: &Tail) -> Result<Option<NoteView>, CoreError>;
 
     /// Create or replace the body with optimistic locking.
     ///
@@ -112,6 +119,9 @@ pub trait NoteRepo: Send + Sync {
 impl<T: NoteRepo + ?Sized> NoteRepo for Arc<T> {
     async fn get(&self, path: &NotePath) -> Result<Option<Note>, CoreError> {
         (**self).get(path).await
+    }
+    async fn get_view(&self, path: &NotePath, tail: &Tail) -> Result<Option<NoteView>, CoreError> {
+        (**self).get_view(path, tail).await
     }
     async fn put(
         &self,
