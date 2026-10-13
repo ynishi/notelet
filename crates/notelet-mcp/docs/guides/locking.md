@@ -14,6 +14,10 @@ note_put  { path, body, expected_version: 7 }
    -> { kind: "Conflict", expected_version: 7, current_version: 9 }   (someone did)
 ```
 
+Never `note_put` a body you read with `truncated: true` (a `note_get` with
+`tail_lines` / `max_bytes` that returned only the end): it would replace the
+whole note with the fragment. Journals are extended with `note_append`.
+
 On a conflict, read again, merge your change into the current body, and
 put with the new version. Do not retry with the old body; that is how a
 colleague's paragraph disappears.

@@ -48,6 +48,15 @@ async fn round_trip_against_postgres() {
     svc.append(&p("j.md"), "second", "t").await.unwrap();
     assert_eq!(svc.get(&p("j.md")).await.unwrap().body, "first\nsecond\n");
 
+    // a tail read cuts the end and reports the whole size
+    let t = svc.read(&p("j.md"), Some(1), None).await.unwrap();
+    assert_eq!(t.body, "second\n");
+    assert!(t.truncated);
+    assert_eq!(t.size, 13);
+    let w = svc.read(&p("j.md"), None, None).await.unwrap();
+    assert_eq!(w.body, "first\nsecond\n");
+    assert!(!w.truncated);
+
     // list with prefix + filter, search, dump
     let l = svc.list(Some(&prefix), &[], None, None).await.unwrap();
     assert_eq!(l.items.len(), 2);

@@ -10,8 +10,8 @@ use chrono::Utc;
 use tokio::sync::Mutex;
 
 use crate::domain::{
-    DumpEntry, Field, Filter, FilterValue, Note, NoteMeta, NotePath, Op, Page, PageOut, Revision,
-    RevisionMeta, SearchHit,
+    DumpEntry, Field, Filter, FilterValue, Note, NoteMeta, NotePath, NoteView, Op, Page, PageOut,
+    Revision, RevisionMeta, SearchHit, Tail,
 };
 use crate::error::CoreError;
 use crate::port::{NoteRepo, PutResult};
@@ -127,6 +127,10 @@ fn after_cursor<'a>(
 impl NoteRepo for MemoryNoteRepo {
     async fn get(&self, path: &NotePath) -> Result<Option<Note>, CoreError> {
         Ok(self.inner.lock().await.notes.get(path.as_str()).cloned())
+    }
+
+    async fn get_view(&self, path: &NotePath, tail: &Tail) -> Result<Option<NoteView>, CoreError> {
+        Ok(self.get(path).await?.map(|note| NoteView::of(note, tail)))
     }
 
     async fn put(

@@ -381,7 +381,7 @@ fn search_form(q: &str, prefix: &str) -> String {
 fn error_page(e: CoreError) -> Response {
     let (status, msg) = match &e {
         CoreError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
-        CoreError::InvalidPath(_) | CoreError::InvalidFilter(_) => {
+        CoreError::InvalidPath(_) | CoreError::InvalidFilter(_) | CoreError::InvalidTail(_) => {
             (StatusCode::BAD_REQUEST, e.to_string())
         }
         _ => {

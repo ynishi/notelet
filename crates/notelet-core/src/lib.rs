@@ -18,10 +18,22 @@
 //!
 //! ```text
 //! Note        path -> body (Markdown), version, updated_at, updated_by
+//! Tail        a read may return only the end of a body: tail_lines (>= 1) selects the last
+//!             lines, max_bytes (>= 1) caps the bytes; the view carries the whole body's
+//!             size and truncated, and a truncated body must never be written back with `put`
 //! Revision    the body a `put` replaced or a `delete` removed, keyed by (path, version)
 //! Filter      field (path | updated_at | updated_by) × op (eq ne like ilike gt lt gte lte) × value
 //! Page        limit (1..=1000; dump 1..=100) + exclusive keyset cursor (the last path of the previous page)
 //! ```
+//!
+//! A tail read ([`domain::Tail`], [`domain::NoteView`]) returns the end of the
+//! body, cut on a line boundary where it can (a single line longer than
+//! `max_bytes` is cut on a char boundary instead; if `max_bytes` is smaller
+//! than the UTF-8 width of the last character the result is empty and
+//! `truncated`). `size` is always the whole body in bytes, the number
+//! `note_list` reports, and `truncated` says the body
+//! is partial. The cut is the pure function [`domain::tail_start`], shared by
+//! both adapters.
 //!
 //! Paths are slash-separated segments of `[A-Za-z0-9._-]`; the tree is only
 //! a naming convention (`projects/<repo>/journal.md`, `tasks/<task>/...`,
@@ -70,8 +82,8 @@ pub mod port;
 pub mod service;
 
 pub use domain::{
-    DumpEntry, Field, Filter, Note, NoteMeta, NotePath, Op, Page, PageOut, Revision, RevisionMeta,
-    SearchHit, WriteOutcome,
+    DumpEntry, Field, Filter, Note, NoteMeta, NotePath, NoteView, Op, Page, PageOut, Revision,
+    RevisionMeta, SearchHit, Tail, WriteOutcome,
 };
 pub use error::CoreError;
 pub use memory::MemoryNoteRepo;
