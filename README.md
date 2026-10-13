@@ -58,6 +58,7 @@ Requirements: a Postgres database. Local development points at a hosted dev data
 export NOTELET_DATABASE_URL=postgres://...      # or DATABASE_URL
 export NOTELET_TOKEN=...                        # or NOTELET_TOKEN_FILE=~/.notelet/token
 export NOTELET_BIND=127.0.0.1:8490              # default; non-loopback requires a token
+export RUST_LOG=info                            # log level; default info
 notelet-mcp serve                               # streamable HTTP at /mcp, /healthz open
 notelet-mcp stdio                               # one local client over stdin/stdout
 notelet-mcp migrate                             # apply migrations and exit
@@ -66,6 +67,8 @@ notelet-mcp export ./backup                     # notes -> file tree
 ```
 
 Migrations are embedded and applied on start.
+
+Logs go to stderr (`stdout` is the protocol in `stdio` mode). `RUST_LOG` selects the level (default `info`). `rmcp` is held at `info` and `sqlx` at `warn` unless `RUST_LOG` names them, because rmcp's `debug` output includes whole requests and results.
 
 ### Clients
 

@@ -75,15 +75,41 @@ enum Cmd {
     },
 }
 
+/// The directives added to the filter text unless it already names the
+/// target (see the comment in `main`). The match is on the exact target:
+/// the text of a directive before its first `=` or `[`, trimmed. A
+/// sub-target such as `rmcp::transport` does not count as naming `rmcp`;
+/// it stays more specific than the added hold, so it still wins.
+fn extra_directives(raw: &str) -> Vec<&'static str> {
+    let named: Vec<&str> = raw
+        .split(',')
+        .map(|d| d.split(['=', '[']).next().unwrap_or("").trim())
+        .collect();
+    [("rmcp", "rmcp=info"), ("sqlx", "sqlx=warn")]
+        .into_iter()
+        .filter(|(target, _)| !named.contains(target))
+        .map(|(_, d)| d)
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // stderr only: stdout is the protocol channel in stdio mode, and a
     // daemon's stderr is its log. No ANSI: the reader is a file or journal.
+    // `rmcp` is held at `info` because its `debug` events carry whole
+    // requests and results, i.e. note bodies: `RUST_LOG=debug` must not
+    // print them. `sqlx` is held at `warn` (statement logging is noise; slow
+    // statements stay visible). Naming either target in `RUST_LOG` wins.
+    let raw = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let mut filter = tracing_subscriber::EnvFilter::try_new(&raw)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    for d in extra_directives(&raw) {
+        if let Ok(d) = d.parse() {
+            filter = filter.add_directive(d);
+        }
+    }
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .try_init();
@@ -129,5 +155,34 @@ async fn main() -> anyhow::Result<()> {
             let svc = Arc::new(NoteService::new(Arc::new(repo)));
             server::run_http(svc, cfg).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extra_directives;
+
+    #[test]
+    fn both_held_by_default() {
+        assert_eq!(extra_directives("info"), vec!["rmcp=info", "sqlx=warn"]);
+    }
+
+    #[test]
+    fn named_target_is_left_alone() {
+        assert_eq!(extra_directives("debug,rmcp=debug"), vec!["sqlx=warn"]);
+        assert_eq!(extra_directives("sqlx=trace"), vec!["rmcp=info"]);
+        assert_eq!(extra_directives(" rmcp = trace "), vec!["sqlx=warn"]);
+    }
+
+    #[test]
+    fn sub_targets_do_not_count_as_naming() {
+        assert_eq!(
+            extra_directives("debug,rmcp::transport=trace"),
+            vec!["rmcp=info", "sqlx=warn"]
+        );
+        assert_eq!(
+            extra_directives("sqlx::query=debug"),
+            vec!["rmcp=info", "sqlx=warn"]
+        );
     }
 }

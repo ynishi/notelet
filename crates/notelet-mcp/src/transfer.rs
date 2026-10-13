@@ -7,9 +7,8 @@
 //!   relative path alone). An existing note is replaced with its current
 //!   version as `expected_version`, so an identical body is a no-op
 //!   (`unchanged`). Hidden entries (name starting with `.`), symlinks,
-//!   non-UTF-8 files and paths that do not validate are skipped with the
-//!   reason on stderr. A directory or entry that cannot be read counts as
-//!   `failed` (reason on stderr) and the walk goes on. `dry_run` reads but
+//!   non-UTF-8 files and paths that do not validate are skipped (the reason is logged at `warn`: path, reason). A directory or
+//!   entry that cannot be read counts as `failed` (logged the same way) and the walk goes on. `dry_run` reads but
 //!   never writes.
 //! * **export** pages through `dump` and writes each note to `<dir>/<path>`,
 //!   creating parent directories. Paths are validated note paths (no `..`,
@@ -68,19 +67,19 @@ pub async fn import(
             None => rel,
         };
         if let Err(e) = NotePath::parse(&raw) {
-            eprintln!("skip {}: {e}", file.display());
+            tracing::warn!(path = %file.display(), reason = %e, "skip");
             summary.skipped += 1;
             continue;
         }
         let body = match std::fs::read(&file).map(String::from_utf8) {
             Ok(Ok(b)) => b,
             Ok(Err(_)) => {
-                eprintln!("skip {}: not UTF-8", file.display());
+                tracing::warn!(path = %file.display(), reason = "not UTF-8", "skip");
                 summary.skipped += 1;
                 continue;
             }
             Err(e) => {
-                eprintln!("fail {}: {e}", file.display());
+                tracing::warn!(path = %file.display(), reason = %e, "fail");
                 summary.failed += 1;
                 continue;
             }
@@ -90,7 +89,7 @@ pub async fn import(
             Ok(Action::Updated) => summary.updated += 1,
             Ok(Action::Unchanged) => summary.unchanged += 1,
             Err(e) => {
-                eprintln!("fail {raw}: {e}");
+                tracing::warn!(path = %raw, reason = %e.chain(), "fail");
                 summary.failed += 1;
             }
         }
@@ -135,7 +134,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, summary: &mut
     let entries = match std::fs::read_dir(dir) {
         Ok(it) => it,
         Err(e) => {
-            eprintln!("fail {}: {e}", dir.display());
+            tracing::warn!(path = %dir.display(), reason = %e, "fail");
             summary.failed += 1;
             return;
         }
@@ -144,7 +143,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, summary: &mut
         let entry = match entry {
             Ok(entry) => entry,
             Err(e) => {
-                eprintln!("fail {}: {e}", dir.display());
+                tracing::warn!(path = %dir.display(), reason = %e, "fail");
                 summary.failed += 1;
                 continue;
             }
@@ -154,16 +153,16 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, summary: &mut
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(e) => {
-                eprintln!("fail {}: {e}", path.display());
+                tracing::warn!(path = %path.display(), reason = %e, "fail");
                 summary.failed += 1;
                 continue;
             }
         };
         if name.to_string_lossy().starts_with('.') {
-            eprintln!("skip {}: hidden", path.display());
+            tracing::warn!(path = %path.display(), reason = "hidden", "skip");
             summary.skipped += 1;
         } else if ft.is_symlink() {
-            eprintln!("skip {}: symlink", path.display());
+            tracing::warn!(path = %path.display(), reason = "symlink", "skip");
             summary.skipped += 1;
         } else if ft.is_dir() {
             walk(root, &path, out, summary);
@@ -175,12 +174,12 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, summary: &mut
             match parts {
                 Some(parts) => out.push((parts.join("/"), path.clone())),
                 None => {
-                    eprintln!("skip {}: file name is not UTF-8", path.display());
+                    tracing::warn!(path = %path.display(), reason = "file name is not UTF-8", "skip");
                     summary.skipped += 1;
                 }
             }
         } else {
-            eprintln!("skip {}: not a regular file", path.display());
+            tracing::warn!(path = %path.display(), reason = "not a regular file", "skip");
             summary.skipped += 1;
         }
     }
@@ -223,7 +222,7 @@ pub async fn export(
             match written {
                 Ok(()) => summary.exported += 1,
                 Err(e) => {
-                    eprintln!("fail {}: {e}", entry.path);
+                    tracing::warn!(path = %entry.path, reason = %e, "fail");
                     summary.failed += 1;
                 }
             }

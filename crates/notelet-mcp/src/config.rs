@@ -8,11 +8,14 @@
 //! | `NOTELET_TOKEN_FILE` | read the token from this file instead (trailing newline stripped) | none |
 //! | `NOTELET_BIND` | `host:port` for `serve` | `127.0.0.1:8490` |
 //! | `NOTELET_ACTOR` | value written to `updated_by` for every write through this process | `mcp` |
+//! | `RUST_LOG` | log filter, read in `main` (`rmcp` is held at `info`, `sqlx` at `warn`, unless named) | `info` |
 //!
 //! A non-loopback bind without a token is refused at startup: a hosted
 //! instance must never be reachable without `Authorization: Bearer`.
 
 use std::net::SocketAddr;
+
+use anyhow::Context;
 
 /// Resolved configuration.
 #[derive(Debug, Clone)]
@@ -33,12 +36,12 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let database_url = std::env::var("NOTELET_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .map_err(|_| anyhow::anyhow!("NOTELET_DATABASE_URL (or DATABASE_URL) is required"))?;
+            .context("NOTELET_DATABASE_URL (or DATABASE_URL) is required")?;
 
         let token = match std::env::var("NOTELET_TOKEN_FILE") {
             Ok(path) if !path.is_empty() => {
                 let raw = std::fs::read_to_string(&path)
-                    .map_err(|e| anyhow::anyhow!("reading NOTELET_TOKEN_FILE {path}: {e}"))?;
+                    .with_context(|| format!("reading NOTELET_TOKEN_FILE {path}"))?;
                 Some(raw.trim_end_matches(['\n', '\r']).to_string())
             }
             _ => std::env::var("NOTELET_TOKEN").ok(),
@@ -48,7 +51,7 @@ impl Config {
         let bind_raw = std::env::var("NOTELET_BIND").unwrap_or_else(|_| Self::DEFAULT_BIND.into());
         let bind: SocketAddr = bind_raw
             .parse()
-            .map_err(|e| anyhow::anyhow!("NOTELET_BIND {bind_raw:?} is not host:port: {e}"))?;
+            .with_context(|| format!("NOTELET_BIND {bind_raw:?} is not host:port"))?;
 
         if !bind.ip().is_loopback() && token.is_none() {
             anyhow::bail!(

@@ -14,7 +14,6 @@ keywords = ["notes", "markdown", "postgres", "mcp", "agent"]
 categories = ["database", "text-processing"]
 
 [dependencies]
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

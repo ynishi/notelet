@@ -54,6 +54,23 @@
 //! [`domain::WriteOutcome`] (version, byte size, SHA-256, changed); for
 //! `delete` these describe the note it removed.
 //!
+//! ## Errors and logging
+//!
+//! The one error type is [`CoreError`]. A variant with a cause (`Storage`)
+//! keeps it as `source()` and never repeats it in `Display`; `chain()`
+//! renders the error and its causes on one line, for a message or a log
+//! field. `Contended` is the append race; `VersionConflict` is the
+//! optimistic lock; `InvalidPath` / `InvalidFilter` / `InvalidTail` are
+//! validation; `NotFound` is a missing note; `Storage` is everything the
+//! adapter could not do.
+//!
+//! The core never logs. It returns errors; the transport decides what to
+//! record and at which level. A chain may name a path (a constraint message
+//! does), never a body. A validation error quotes the rejected input (a
+//! path, an unknown filter field or op, an unparsable `updated_at` value);
+//! the MCP tools log these at `debug`, and `import` logs a rejected file
+//! path at `warn`. The enum is `#[non_exhaustive]`.
+//!
 //! ## Layout (lightweight DDD / Clean)
 //!
 //! | module | role |
