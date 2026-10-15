@@ -27,4 +27,9 @@ A deployment's secrets live in the platform (`fly secrets`) and in the operator'
 
 ## Leak handling
 
-If something private lands here it is treated as published: rotate what was exposed. History is rewritten only when the maintainer decides it is worth it. Prevention is cheaper, and keeping private values out of the working tree is what notelet itself is for.
+Two cases, handled differently:
+
+- **A secret** (a token, a database URL, a deployment's hostname or Fly app name, note content) that lands here is treated as published: rotate what can be rotated at once, and rewrite history to remove it.
+- **A non-secret** (a local path, a working note, a stray file) is removed in an ordinary commit. Nothing is rotated and history is not rewritten for it; the commit log stays as it is.
+
+Prevention is cheaper, and keeping private values out of the working tree is what notelet itself is for.
