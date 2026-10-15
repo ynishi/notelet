@@ -78,6 +78,13 @@ notelet-mcp token alice                         # new token for a client + its N
 
 The single `NOTELET_TOKEN` / `NOTELET_TOKEN_FILE` still works and joins the same table, written as `NOTELET_ACTOR` (default `mcp`); `NOTELET_ACTOR` is also the actor for `stdio`, `import` and a loopback `serve` without tokens. Clients that share one token are indistinguishable in `updated_by`. `note_delete` records no actor: the kept revision names the last writer.
 
+Moving a running deployment from the single token to one token per client, without a moment where a client is refused:
+
+1. Run a version that reads `NOTELET_TOKENS` (0.3.0 or later), still with the single token set.
+2. Issue a token per client and add all the entries to `NOTELET_TOKENS` next to the single token; restart. Both credentials now work.
+3. Move each client to its own token. Until it moves, its writes keep the `NOTELET_ACTOR` name.
+4. When every client has moved, remove the single token and restart. A client still holding it now gets `401`.
+
 Migrations are embedded and applied on start.
 
 Logs go to stderr (`stdout` is the protocol in `stdio` mode). `RUST_LOG` selects the level (default `info`). `rmcp` is held at `info` and `sqlx` at `warn` unless `RUST_LOG` names them, because rmcp's `debug` output includes whole requests and results.
