@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/ynishi/notelet/compare/v0.2.0...v0.3.0) - 2026-10-15
+
+### Added
+
+- record the authenticating token's actor in updated_by
+
+### Other
+
+- Describe moving a deployment from the single token to one token per client
+
 ## [0.2.0](https://github.com/ynishi/notelet/compare/v0.1.1...v0.2.0) - 2026-10-13
 
 ### Added
