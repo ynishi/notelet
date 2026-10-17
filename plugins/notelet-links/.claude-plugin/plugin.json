@@ -1,0 +1,21 @@
+{
+  "name": "notelet-links",
+  "version": "0.1.0",
+  "description": "Links to the notelet notes this session wrote, above the prompt and in /notes",
+  "author": {
+    "name": "Yutaka Nishimura"
+  },
+  "homepage": "https://github.com/ynishi/notelet",
+  "repository": "https://github.com/ynishi/notelet",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["notelet", "notes", "mcp", "links"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "ui_base_url": {
+      "type": "string",
+      "title": "notelet /ui base URL",
+      "description": "Where the browser view is served, without /ui (e.g. http://127.0.0.1:8080). Empty: paths are shown without links.",
+      "default": ""
+    }
+  }
+}

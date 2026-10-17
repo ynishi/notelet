@@ -9,3 +9,5 @@
 *.swp
 /.sandbox-snapshots/
 /.fly-proxy.log
+/plugins/*/.claude-plugin/types/
+/plugins/*/tsconfig.json
