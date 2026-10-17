@@ -9,14 +9,16 @@
 //! notelet-mcp token <actor>                             # new bearer token + its NOTELET_TOKENS entry
 //! ```
 //!
-//! Configuration is environment only (see [`config`]): a database URL,
-//! bearer tokens (each mapped to the actor it writes as), a bind address, a
-//! fallback actor name. There is no config file,
+//! Configuration is environment only (see [`config`]): a database URL (or,
+//! for `serve` and `stdio`, the URL and token of a remote notelet in its
+//! place, see [`remote`]), bearer tokens (each mapped to the actor it
+//! writes as), a bind address, a fallback actor name. There is no config file,
 //! because the host (Fly, systemd, a shell) already has a way to set
 //! environment variables and a second mechanism would have to be kept in
 //! agreement with it.
 //!
-//! The server itself lives in [`server`]; the bundled guides in
+//! The server itself lives in [`server`] (its local mode, which needs `NOTELET_FILE_ROOT`,
+//! adds the file projection of [`files`]); the bundled guides in
 //! [`resources`]; token lookup and the per-token actor in [`auth`]; the
 //! operator's bulk
 //! `import` / `export` (not MCP tools) in [`transfer`]; the read-only
@@ -25,6 +27,8 @@
 
 mod auth;
 mod config;
+mod files;
+mod remote;
 mod render;
 mod resources;
 mod server;
@@ -34,9 +38,10 @@ mod ui;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use notelet_core::{NoteService, PgNoteRepo};
+use notelet_core::{NoteRepo, NoteService, PgNoteRepo};
 
-use crate::config::Config;
+use crate::config::{Backend, Config};
+use crate::remote::RemoteNoteRepo;
 
 #[derive(Parser)]
 #[command(
@@ -152,25 +157,31 @@ async fn main() -> anyhow::Result<()> {
     if let Some(Cmd::Token { actor }) = &cli.cmd {
         return print_token(actor);
     }
-    let cfg = Config::from_env()?;
+    let (cfg, backend) = Config::from_env()?;
 
-    let repo = PgNoteRepo::connect(&cfg.database_url).await?;
     match cli.cmd.unwrap_or(Cmd::Serve) {
+        Cmd::Stdio => {
+            cfg.check_file_root()?;
+            let svc = Arc::new(NoteService::new(open_serving_repo(&backend).await?));
+            server::run_stdio(svc, cfg.actor, cfg.file_root.map(files::FileRoot::new)).await
+        }
+        Cmd::Serve => {
+            cfg.check_file_root()?;
+            let svc = Arc::new(NoteService::new(open_serving_repo(&backend).await?));
+            server::run_http(svc, cfg).await
+        }
         Cmd::Migrate => {
+            let repo = PgNoteRepo::connect(backend.database_url("migrate")?).await?;
             repo.migrate().await?;
             tracing::info!("migrations applied");
             Ok(())
-        }
-        Cmd::Stdio => {
-            repo.migrate().await?;
-            let svc = Arc::new(NoteService::new(Arc::new(repo)));
-            server::run_stdio(svc, cfg.actor).await
         }
         Cmd::Import {
             dir,
             prefix,
             dry_run,
         } => {
+            let repo = PgNoteRepo::connect(backend.database_url("import")?).await?;
             // A dry run only reads; it must not change the schema either.
             if !dry_run {
                 repo.migrate().await?;
@@ -182,18 +193,31 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Export { dir, prefix } => {
+            let repo = PgNoteRepo::connect(backend.database_url("export")?).await?;
             let svc = NoteService::new(Arc::new(repo));
             let summary = transfer::export(&svc, &dir, prefix.as_deref()).await?;
             println!("{summary}");
             Ok(())
         }
         Cmd::Token { .. } => unreachable!("handled before the database is opened"),
-        Cmd::Serve => {
-            repo.migrate().await?;
-            let svc = Arc::new(NoteService::new(Arc::new(repo)));
-            server::run_http(svc, cfg).await
-        }
     }
+}
+
+/// The store `serve` and `stdio` run on: Postgres (migrated on start), or
+/// the remote notelet, in which case nothing is migrated and no database is
+/// touched.
+async fn open_serving_repo(backend: &Backend) -> anyhow::Result<Arc<dyn NoteRepo>> {
+    Ok(match backend {
+        Backend::Database(url) => {
+            let repo = PgNoteRepo::connect(url).await?;
+            repo.migrate().await?;
+            Arc::new(repo)
+        }
+        Backend::Remote(r) => {
+            tracing::info!("using a remote notelet as the store");
+            Arc::new(RemoteNoteRepo::connect(&r.url, r.token.as_deref()).await?)
+        }
+    })
 }
 
 #[cfg(test)]

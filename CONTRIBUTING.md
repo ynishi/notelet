@@ -5,7 +5,7 @@ notelet is small on purpose. The bar for a change is "does the model need this?"
 ## Ground rules
 
 - **The crate docs are the design.** `cargo doc` on `notelet-core` is the design document. A pull request that changes behaviour without changing the relevant doc comment is incomplete.
-- **Eight tools, two tables.** Adding a tool, a table or a column needs an issue first that says what cannot be done with `note_dump` plus a tool beside notelet.
+- **A new tool, table or column needs an issue first.** The issue says what cannot be done with `note_dump` plus a tool beside notelet.
 - **SQL only in `pg.rs`, values always bound.** See `notelet_core::pg`.
 - **Adapters implement the port, nothing more.** `NoteRepo` is the contract; the in-memory adapter must keep matching the Postgres one so the service tests mean something.
 - **Nothing private, ever.** No real URLs, tokens, user names or note content, in code, tests, docs or commit messages.

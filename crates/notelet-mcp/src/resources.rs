@@ -1,7 +1,8 @@
 //! MCP resources: the guides under `docs/guides/` baked into the binary
 //! with `include_str!`, served as `notelet://guides/<slug>`. The guide is
 //! the source of truth for how to use a tool; the README points here rather
-//! than repeating it.
+//! than repeating it. `tools.md` is the exception: it is generated from the
+//! tool router by `just gen-docs`, not written by hand.
 
 use rmcp::model::{ListResourcesResult, ReadResourceResult, Resource, ResourceContents};
 
@@ -36,6 +37,13 @@ const GUIDES: &[Guide] = &[
         description: "The note_list filter vocabulary, how values are bound, and how cursors page.",
         body: include_str!("../docs/guides/filters.md"),
     },
+    Guide {
+        uri: "notelet://guides/tools",
+        name: "tools",
+        title: "Tools: the list, generated from the tool router",
+        description: "Every tool with the first sentence of its description.",
+        body: include_str!("../docs/guides/tools.md"),
+    },
 ];
 
 /// All bundled guides, as MCP resources.
@@ -66,9 +74,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lists_three_guides_and_reads_them() {
+    fn lists_guides_and_reads_them() {
         let list = list_all();
-        assert_eq!(list.resources.len(), 3);
+        assert_eq!(list.resources.len(), GUIDES.len());
+        assert!(read("notelet://guides/tools").is_some());
         for g in GUIDES {
             assert!(read(g.uri).is_some(), "{}", g.uri);
             assert!(!g.body.trim().is_empty(), "{} is empty", g.uri);

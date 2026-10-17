@@ -3,13 +3,17 @@
 //!
 //! | variable | meaning | default |
 //! |---|---|---|
-//! | `NOTELET_DATABASE_URL` (or `DATABASE_URL`) | Postgres connection string | required |
+//! | `NOTELET_DATABASE_URL` (or `DATABASE_URL`) | Postgres connection string | required, unless `NOTELET_REMOTE_URL` is set |
+//! | `NOTELET_REMOTE_URL` | MCP endpoint of another notelet (`http(s)://host/mcp`): `serve` and `stdio` use it as their store instead of Postgres (see [`crate::remote`]) | none |
+//! | `NOTELET_REMOTE_TOKEN` | bearer token presented to the remote; it selects the actor the remote records | none |
+//! | `NOTELET_REMOTE_TOKEN_FILE` | read that token from this file instead (wins over `NOTELET_REMOTE_TOKEN`; trailing newline stripped) | none |
 //! | `NOTELET_TOKENS` | credentials, one per client: entries `<actor>:<sha256 hex of the token>` separated by whitespace; a request's token selects the actor written to `updated_by` | none |
 //! | `NOTELET_TOKENS_FILE` | read the entries from this file instead (wins over `NOTELET_TOKENS`); same format | none |
 //! | `NOTELET_TOKEN` | one bearer token, written as `NOTELET_ACTOR`; joins the table above | none |
 //! | `NOTELET_TOKEN_FILE` | read that token from this file instead (trailing newline stripped) | none |
 //! | `NOTELET_BIND` | `host:port` for `serve` | `127.0.0.1:8490` |
 //! | `NOTELET_ACTOR` | (same name rule as actors, checked at startup) `updated_by` for `NOTELET_TOKEN`, and for writes with no credential (`stdio`, `import`, a loopback `serve` without tokens) | `mcp` |
+//! | `NOTELET_FILE_ROOT` | an existing directory (checked by `serve` and `stdio` only) that `to_file` / `from_file` / `note_restore` names are relative to; setting it switches on local mode for `stdio`, and for a loopback `serve` that has a token (see [`crate::files`] and [`crate::server`]). It should be outside any repository checkout, since note bodies are private | none: no file access |
 //! | `RUST_LOG` | log filter, read in `main` (`rmcp` is held at `info`, `sqlx` at `warn`, unless named) | `info` |
 //!
 //! The token table is the union of `NOTELET_TOKENS[_FILE]` and the single
@@ -22,38 +26,163 @@
 //! (see [`crate::auth`]). `notelet-mcp token <actor>` makes a token and its
 //! entry line.
 //!
+//! The store is one of two [`Backend`]s. With `NOTELET_REMOTE_URL` set there
+//! is no database: startup fails if a database URL is set as well (two
+//! stores is a mistake, not a preference), and only `serve` and `stdio`
+//! run; `migrate`, `import` and `export` need the database and fail with an
+//! error naming the variable to unset. A global `DATABASE_URL` counts as a
+//! database URL, so it makes a remote start refuse; `NOTELET_DATABASE_URL=`
+//! set to empty takes precedence over it and masks it (empty is unset).
+//! The remote token variables are read only when `NOTELET_REMOTE_URL` is set. `NOTELET_REMOTE_TOKEN[_FILE]` is
+//! separate from `NOTELET_TOKEN[_FILE]`: the first is the credential this
+//! process presents upstream, the second is one it accepts from its clients.
+//!
 //! A non-loopback bind with an empty table is refused at startup: a hosted
 //! instance must never be reachable without `Authorization: Bearer`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::Context;
 
 use crate::auth::{digest, valid_actor, Actor, TokenTable, TOKEN_PREFIX};
 
+/// Where the notes live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Backend {
+    /// Postgres at this connection string.
+    Database(String),
+    /// Another notelet, reached over MCP.
+    Remote(RemoteConfig),
+}
+
+/// The remote notelet of [`Backend::Remote`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct RemoteConfig {
+    pub url: String,
+    /// Bearer token for the remote; `None` for a remote without tokens.
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for RemoteConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteConfig")
+            .field("url", &"<set>")
+            .field("token", &self.token.as_ref().map(|_| "<set>"))
+            .finish()
+    }
+}
+
+impl Backend {
+    /// The connection string, for the commands that need the database
+    /// (`migrate`, `import`, `export`). `command` names the caller in the
+    /// error when the backend is remote.
+    pub fn database_url(&self, command: &str) -> anyhow::Result<&str> {
+        match self {
+            Self::Database(url) => Ok(url),
+            Self::Remote(_) => anyhow::bail!(
+                "`{command}` needs the database, but NOTELET_REMOTE_URL is set \
+                 (unset it and set NOTELET_DATABASE_URL; only `serve` and `stdio` \
+                 can use a remote)"
+            ),
+        }
+    }
+}
+
+/// Choose the backend from the raw values. Empty strings count as unset.
+fn resolve_backend(
+    database_url: Option<String>,
+    remote_url: Option<String>,
+    remote_token: Option<String>,
+) -> anyhow::Result<Backend> {
+    let database_url = database_url.filter(|v| !v.is_empty());
+    let remote_url = remote_url.filter(|v| !v.is_empty());
+    match (database_url, remote_url) {
+        (Some(_), Some(_)) => anyhow::bail!(
+            "NOTELET_REMOTE_URL and NOTELET_DATABASE_URL (or DATABASE_URL) are both set: \
+             choose one store"
+        ),
+        (Some(url), None) => Ok(Backend::Database(url)),
+        (None, Some(url)) => {
+            anyhow::ensure!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "NOTELET_REMOTE_URL must start with http:// or https://"
+            );
+            Ok(Backend::Remote(RemoteConfig {
+                url,
+                token: remote_token.filter(|t| !t.is_empty()),
+            }))
+        }
+        (None, None) => anyhow::bail!(
+            "NOTELET_DATABASE_URL (or DATABASE_URL) is required \
+             (or NOTELET_REMOTE_URL for `serve` and `stdio`)"
+        ),
+    }
+}
+
+/// A token from `file_var` (trailing newline stripped; wins) or else `var`.
+fn token_from_env(file_var: &str, var: &str) -> anyhow::Result<Option<String>> {
+    Ok(match std::env::var(file_var) {
+        Ok(path) if !path.is_empty() => {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {file_var} {path}"))?;
+            Some(raw.trim_end_matches(['\n', '\r']).to_string())
+        }
+        _ => std::env::var(var).ok(),
+    }
+    .filter(|t| !t.is_empty()))
+}
+
 /// Resolved configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub database_url: String,
     /// Credential -> actor. Empty means no authentication (loopback only).
     pub tokens: TokenTable,
     pub bind: SocketAddr,
     /// The actor for writes that carry no credential: `stdio`, `import`, a
     /// tokenless loopback `serve`; also the actor of `NOTELET_TOKEN`.
     pub actor: String,
+    /// `NOTELET_FILE_ROOT`: the directory of local mode's file names, if set.
+    pub file_root: Option<PathBuf>,
 }
 
 impl Config {
+    /// Fail unless `NOTELET_FILE_ROOT`, when set, names an existing
+    /// directory (a typo must not quietly turn the feature off or point it
+    /// somewhere else). Called for `serve` and `stdio` only; the value is
+    /// not echoed.
+    pub fn check_file_root(&self) -> anyhow::Result<()> {
+        if let Some(root) = &self.file_root {
+            anyhow::ensure!(
+                root.is_dir(),
+                "NOTELET_FILE_ROOT must be an existing directory"
+            );
+        }
+        Ok(())
+    }
+
     /// Default bind address: loopback, so a bare `serve` is never exposed.
     pub const DEFAULT_BIND: &'static str = "127.0.0.1:8490";
 
-    /// Read the environment. Fails on a missing database URL, a malformed
-    /// bind address, an unreadable token file, a malformed or duplicated
-    /// token entry, or an exposed bind without any token.
-    pub fn from_env() -> anyhow::Result<Self> {
+    /// Read the environment. Fails on neither a database URL nor a remote
+    /// URL, on both, a malformed bind address, an unreadable token file, a
+    /// malformed or duplicated token entry, or an exposed bind without any
+    /// token.
+    pub fn from_env() -> anyhow::Result<(Self, Backend)> {
         let database_url = std::env::var("NOTELET_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .context("NOTELET_DATABASE_URL (or DATABASE_URL) is required")?;
+            .ok();
+        let remote_url = std::env::var("NOTELET_REMOTE_URL")
+            .ok()
+            .filter(|u| !u.is_empty());
+        // the remote token (and its file) is read only for a remote start, so
+        // a stale file cannot fail a database-backed one
+        let remote_token = if remote_url.is_some() {
+            token_from_env("NOTELET_REMOTE_TOKEN_FILE", "NOTELET_REMOTE_TOKEN")?
+        } else {
+            None
+        };
+        let backend = resolve_backend(database_url, remote_url, remote_token)?;
 
         let actor = fallback_actor(std::env::var("NOTELET_ACTOR").ok())?;
 
@@ -72,18 +201,12 @@ impl Config {
             parse_entries(&text, source, &mut tokens)?;
         }
 
-        let single = match std::env::var("NOTELET_TOKEN_FILE") {
-            Ok(path) if !path.is_empty() => {
-                let raw = std::fs::read_to_string(&path)
-                    .with_context(|| format!("reading NOTELET_TOKEN_FILE {path}"))?;
-                Some(raw.trim_end_matches(['\n', '\r']).to_string())
-            }
-            _ => std::env::var("NOTELET_TOKEN").ok(),
-        }
-        .filter(|t| !t.is_empty());
+        let single = token_from_env("NOTELET_TOKEN_FILE", "NOTELET_TOKEN")?;
         if let Some(token) = single {
             add_single_token(&mut tokens, &token, &actor)?;
         }
+
+        let file_root = resolve_file_root(std::env::var("NOTELET_FILE_ROOT").ok());
 
         let bind_raw = std::env::var("NOTELET_BIND").unwrap_or_else(|_| Self::DEFAULT_BIND.into());
         let bind: SocketAddr = bind_raw
@@ -98,13 +221,24 @@ impl Config {
             );
         }
 
-        Ok(Self {
-            database_url,
-            tokens,
-            bind,
-            actor,
-        })
+        Ok((
+            Self {
+                tokens,
+                bind,
+                actor,
+                file_root,
+            },
+            backend,
+        ))
     }
+}
+
+/// `NOTELET_FILE_ROOT`: unset or empty is no file access. Whether the
+/// directory exists is checked by [`Config::check_file_root`], which only
+/// `serve` and `stdio` call, so a stale value does not stop `migrate`,
+/// `import` or `export`.
+fn resolve_file_root(raw: Option<String>) -> Option<PathBuf> {
+    raw.filter(|r| !r.is_empty()).map(PathBuf::from)
 }
 
 /// `NOTELET_ACTOR`: unset or empty is `mcp`; anything else must be a valid
@@ -241,6 +375,94 @@ mod tests {
             assert!(err.contains("NOTELET_ACTOR"), "{err}");
             assert!(!err.contains(bad));
         }
+    }
+
+    #[test]
+    fn file_root_is_explicit_and_checked_only_when_serving() {
+        assert_eq!(resolve_file_root(None), None);
+        assert_eq!(resolve_file_root(Some(String::new())), None);
+        // reading a stale value does not fail: migrate / import / export never check it
+        let stale = resolve_file_root(Some("/no/such/directory/for/notelet".into()));
+        assert_eq!(stale, Some(PathBuf::from("/no/such/directory/for/notelet")));
+        let cfg = |root: Option<PathBuf>| Config {
+            tokens: TokenTable::default(),
+            bind: Config::DEFAULT_BIND.parse().unwrap(),
+            actor: "mcp".into(),
+            file_root: root,
+        };
+        assert!(cfg(None).check_file_root().is_ok());
+        assert!(cfg(Some(env!("CARGO_MANIFEST_DIR").into()))
+            .check_file_root()
+            .is_ok());
+        let err = cfg(stale).check_file_root().unwrap_err().to_string();
+        assert!(err.contains("NOTELET_FILE_ROOT"), "{err}");
+        assert!(!err.contains("/no/such"), "the value is not echoed: {err}");
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(cfg(Some(file.into())).check_file_root().is_err());
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn remote_and_database_together_refuse_to_start() {
+        let err = resolve_backend(some("pg://x"), some("http://127.0.0.1:1/mcp"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("both set"), "{err}");
+        assert!(
+            !err.contains("pg://x") && !err.contains("127.0.0.1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn remote_alone_needs_no_database_url() {
+        let b =
+            resolve_backend(None, some("http://127.0.0.1:1/mcp"), some("s3cr3t-value")).unwrap();
+        let Backend::Remote(r) = b else {
+            panic!("expected remote")
+        };
+        assert_eq!(r.url, "http://127.0.0.1:1/mcp");
+        assert_eq!(r.token.as_deref(), Some("s3cr3t-value"));
+        // the token and url never show in Debug
+        let dbg = format!("{r:?}");
+        assert!(
+            !dbg.contains("s3cr3t-value") && !dbg.contains("127.0.0.1"),
+            "{dbg}"
+        );
+        // empty values are unset
+        let b = resolve_backend(some(""), some("http://h/mcp"), some("")).unwrap();
+        assert!(matches!(
+            b,
+            Backend::Remote(RemoteConfig { token: None, .. })
+        ));
+    }
+
+    #[test]
+    fn a_store_is_required_and_a_remote_url_must_be_http() {
+        let err = resolve_backend(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("NOTELET_DATABASE_URL"), "{err}");
+        assert!(resolve_backend(None, some("ftp://h"), None).is_err());
+        assert_eq!(
+            resolve_backend(some("pg://x"), None, None).unwrap(),
+            Backend::Database("pg://x".into())
+        );
+    }
+
+    #[test]
+    fn database_commands_fail_clearly_on_a_remote() {
+        let remote = resolve_backend(None, some("http://h/mcp"), None).unwrap();
+        for cmd in ["migrate", "import", "export"] {
+            let err = remote.database_url(cmd).unwrap_err().to_string();
+            assert!(
+                err.contains(cmd) && err.contains("NOTELET_REMOTE_URL"),
+                "{err}"
+            );
+        }
+        let db = Backend::Database("pg://x".into());
+        assert_eq!(db.database_url("import").unwrap(), "pg://x");
     }
 
     #[test]

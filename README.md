@@ -1,6 +1,6 @@
 # notelet
 
-A thin, hosted store for Markdown notes that coding agents read and write over MCP. One table of notes keyed by path, one append-only history table, optimistic locking, a filter that is a thin wrapper over SQL, and eight tools. Nothing else.
+A thin, hosted store for Markdown notes that coding agents read and write over MCP. One table of notes keyed by path, one append-only history table, optimistic locking, a filter that is a thin wrapper over SQL, and the tools listed below. Nothing else.
 
 ## Why
 
@@ -17,16 +17,21 @@ Page        limit (1..=1000; dump 1..=100) + exclusive keyset cursor
 
 Paths are slash-separated segments of `[A-Za-z0-9._-]`; the tree (`projects/<repo>/journal.md`, `tasks/<task>/...`, `lists/<name>.md`) is a naming convention served by the prefix listing, not a directory object.
 
-| tool | does |
-|---|---|
-| `note_get` | read one note with its version; `tail_lines` / `max_bytes` read only its end (`size`, `truncated` say it is partial) |
-| `note_put` | create or replace the whole body; `expected_version` must match or you get `Conflict` with `current_version`; an identical body is a no-op (`changed: false`) |
-| `note_append` | add a line at the end, no version needed (journals, or uploading a large body in chunks) |
-| `note_delete` | remove a note; its body stays readable through `note_history` |
-| `note_list` | metadata (size in bytes) under a prefix, filtered, paged |
-| `note_search` | case-insensitive substring over bodies, with a snippet |
-| `note_history` | bodies that `note_put` replaced or `note_delete` removed (`include_body: false` for metadata only) |
-| `note_dump` | paths and bodies under a prefix: a file tree, for backup or for leaving |
+The list is generated from the tool router (also served as `notelet://guides/tools`); run `just gen-docs` after changing a tool.
+
+<!-- tools:begin -->
+| tool | does | local only |
+|---|---|---|
+| `note_append` | Append text to the end of a note (created if missing), on its own line. | |
+| `note_delete` | Remove a note. | |
+| `note_dump` | Paths and full bodies under a prefix, ordered by path and paged: default 20, max 100 (bodies are heavy); pass next_cursor as cursor (exclusive). | |
+| `note_get` | Read one note: path, body (Markdown), version, updated_at, updated_by, size, truncated. | `to_file` |
+| `note_history` | Bodies that note_put replaced or note_delete removed for this path, newest first (default 20, max 50). | |
+| `note_list` | List notes (path, version, updated_at, updated_by, size in bytes (UTF-8); no body) under a prefix, filtered by ANDed predicates {field, op, value}. | |
+| `note_put` | Create or replace a note's whole body with optimistic locking. | `from_file`, `on_conflict` |
+| `note_restore` | Rewrite a conflict file (written by note_put with on_conflict="mark") to one section's body, exactly as it was before marking; local mode only. | the tool |
+| `note_search` | Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. | |
+<!-- tools:end -->
 
 Writes answer `{ path, version, updated_at, size, sha256, changed }` so a caller can verify a round trip without reading the body back.
 
@@ -52,13 +57,14 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ynishi/notelet/rel
 
 ## Run
 
-Requirements: a Postgres database. Local development points at a hosted dev database; there is no local Docker setup to maintain.
+Requirements: a Postgres database, or (for `serve` and `stdio` only) another notelet to forward to. Local development points at a hosted dev database; there is no local Docker setup to maintain.
 
 ```sh
 export NOTELET_DATABASE_URL=postgres://...      # or DATABASE_URL
 export NOTELET_TOKEN=...                        # one shared token; or NOTELET_TOKEN_FILE=~/.notelet/token
 export NOTELET_TOKENS_FILE=~/.notelet/tokens    # one token per client (below); or NOTELET_TOKENS="alice:<sha256> bob:<sha256>"
 export NOTELET_BIND=127.0.0.1:8490              # default; non-loopback requires a token
+export NOTELET_FILE_ROOT=/path/to/work          # an existing directory outside any repository checkout: switches on local mode (to_file / from_file / note_restore) for stdio, and for a loopback serve with a token; unset = no file access
 export RUST_LOG=info                            # log level; default info
 notelet-mcp serve                               # streamable HTTP at /mcp, /healthz open
 notelet-mcp stdio                               # one local client over stdin/stdout
@@ -86,6 +92,18 @@ Moving a running deployment from the single token to one token per client, witho
 4. When every client has moved, remove the single token and restart. A client still holding it now gets `401`.
 
 Migrations are embedded and applied on start.
+
+### Using another notelet as the store
+
+Instead of a database, `serve` and `stdio` can forward every read and write to a hosted notelet over MCP, so a laptop keeps its own endpoint (`serve` also keeps `/ui`) without a database or the database URL:
+
+```sh
+export NOTELET_REMOTE_URL=https://<host>/mcp      # instead of NOTELET_DATABASE_URL
+export NOTELET_REMOTE_TOKEN_FILE=~/.notelet/token # or NOTELET_REMOTE_TOKEN; the file wins
+notelet-mcp stdio
+```
+
+Setting both a remote URL and a database URL stops startup; a global `DATABASE_URL` counts, so set `NOTELET_DATABASE_URL=` to empty to mask it. `migrate`, `import` and `export` need the database and fail if `NOTELET_REMOTE_URL` is set; no migrations run in remote mode. Writes are recorded under the actor of the remote token: the remote cannot be told another name, so give each client machine its own token there (the local `NOTELET_TOKENS` / `NOTELET_TOKEN` only decide who may call this process; `NOTELET_ACTOR` has no effect on the remote). The process holds one MCP session to the remote for all its local sessions (re-opened if the remote expires it), does not start if the remote is unreachable, and gives up on a connect or a call after 30 seconds (not configurable; the cancel rmcp posts after a timed-out call is bounded by 2 seconds, so a stalled call costs about 32 seconds, and N concurrent stalled calls about 30 seconds plus 2 per call, since cancels go out one at a time). A transport error message names the remote URL (for your own log and client); the token never appears. `NOTELET_REMOTE_TOKEN` is the credential this process presents; `NOTELET_TOKEN` is one it accepts. `append` and `delete` take two calls to the remote (a read-back, and a read before the delete), so they are not atomic with other writers beyond what the remote's version check gives.
 
 Logs go to stderr (`stdout` is the protocol in `stdio` mode). `RUST_LOG` selects the level (default `info`). `rmcp` is held at `info` and `sqlx` at `warn` unless `RUST_LOG` names them, because rmcp's `debug` output includes whole requests and results.
 

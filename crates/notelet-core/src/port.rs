@@ -1,6 +1,12 @@
 //! The storage port. [`NoteRepo`] is the whole contract between the service
-//! and an adapter; the Postgres adapter and the in-memory adapter both
-//! implement it, and the MCP binary holds it as `Arc<dyn NoteRepo>`.
+//! and an adapter. There are three: the Postgres adapter ([`crate::pg`]) and
+//! the in-memory adapter ([`crate::memory`]) in this crate, and the remote
+//! adapter in `notelet-mcp`, which forwards each method to the MCP tool of
+//! another notelet and so lets a process serve with no database. The MCP
+//! binary holds the chosen one as `Arc<dyn NoteRepo>`. An adapter that is not
+//! the store itself may not be able to honour every argument: the remote
+//! one cannot send `by` (the remote records the actor of the token it
+//! presents), which is why `by` is the caller's request, not a guarantee.
 //!
 //! The port carries the locking semantics ([`NoteRepo::put`],
 //! [`NoteRepo::delete`]) because the check-and-write must be atomic inside

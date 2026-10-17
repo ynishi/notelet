@@ -90,6 +90,10 @@
 //! tags, a query language, full-text indexing, multiple tables, users.
 //! If a need for one of these appears, the answer is usually a path
 //! convention or a second small tool, not a feature here.
+//!
+//! The local file projection in `notelet-mcp` (`to_file`, `from_file` and the
+//! conflict file) is an I/O variant of get/put, not a model object, in the
+//! same way as `/ui`: the core knows nothing of it.
 
 pub mod domain;
 pub mod error;
