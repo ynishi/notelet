@@ -139,6 +139,8 @@ bearer_token_env_var = "NOTELET_TOKEN"
 
 When tokens are configured, the browser asks for HTTP Basic credentials: any user name, any listed token as the password (looked up by its sha256 digest; a failure is `401` with `WWW-Authenticate: Basic realm="notelet", charset="UTF-8"`). Without tokens (loopback binds only) there is no credential, so both `/mcp` and `/ui` accept only a loopback `Host` value (`localhost`, `127.0.0.1` or `[::1]`, any port) and answer `403` otherwise. `/mcp` keeps its bearer check and `/healthz` stays open.
 
+On a note page every heading has an `id`, a `¶` link to it, and right after it a reference of its section, `notelet:<path>@v<version>#L<first>-L<last> "<heading line>"`; the whole note's `notelet:<path>@v<version>` is at the top. Each is a `<code>` element that one click selects, for pasting to an agent. Lines are 1-based lines of the body as `note_get` returns it; `notelet://guides/onboarding` says how an agent resolves one (including a version that `note_history` does not hold because only `note_append` moved the note on: appends add lines at the end, so the range holds as given). It is plain text: no script, same Content-Security-Policy.
+
 The view is a projection, not part of the model: it calls the same `get` / `list` / `search` the tools do, has no route that writes, and adds no tool. Raw HTML in a note is shown as text, links keep only `http`, `https`, `mailto` or relative URLs, images are shown as links rather than loaded, pages carry no script and no external asset, and every page is sent with `Cache-Control: no-store`.
 
 ## Layout

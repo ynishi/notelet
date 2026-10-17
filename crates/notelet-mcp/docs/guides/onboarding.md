@@ -56,6 +56,22 @@ alone), skips hidden files, symlinks, non-UTF-8 files and invalid paths,
 and prints `created / updated / unchanged / skipped / failed` counts.
 `export` writes every note to `<dir>/<path>`.
 
+## References a human gives you
+
+A person reading a note in the browser view can copy a reference and paste it to you:
+
+```
+notelet:<path>@v<version>                              the whole note
+notelet:<path>@v<version>#L<first>-L<last> "<heading>"  one section
+```
+
+Lines are 1-based lines of the Markdown body exactly as `note_get` returns it (not of the rendered page). A section runs from its heading line to the line before the next heading of the same or a higher level, or to the last line. The quoted text is that heading line as written.
+
+To resolve one: `note_get { path }`. If its `version` equals `<version>`, the range is exact; read those lines. If the note has moved on:
+
+- Moved on by `note_append` only: the old version is not in `note_history` (it holds only bodies that `note_put` replaced or `note_delete` removed), but appends only add lines at the end, so lines 1..N of the old version are unchanged and the range can be used as given. The last section may now run longer.
+- Moved on by `note_put`: the range may be stale. Read the version the person saw with `note_history { path }`, find the quoted heading line in the current body, and take the section from there. If that line occurs more than once, take the occurrence with the same index (n-th) as in the version the reference names. If the heading no longer exists, say so instead of guessing.
+
 ## What notelet does not do
 
 Its tools do not render, link, or structure notes. It does not know about users.
