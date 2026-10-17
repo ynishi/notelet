@@ -1,5 +1,6 @@
-//! [`NoteletMcp`]: the MCP server. Eight tools, three guide resources, two
-//! transports. Every tool is one [`NoteService`] call plus serialisation.
+//! [`NoteletMcp`]: the MCP server. The tools (listed in the generated
+//! `notelet://guides/tools`), the guide resources and two transports.
+//! Every tool is one [`NoteService`] call plus serialisation.
 //! Writes (`note_put`, `note_append`, `note_delete`) answer a
 //! [`WriteOutcome`] (path, version, updated_at, size in bytes, sha256,
 //! changed) so the caller can verify the round trip without re-reading.
@@ -378,9 +379,7 @@ impl ServerHandler for NoteletMcp {
         info.instructions = Some(
             "notelet is a thin store of Markdown notes addressed by path \
              (projects/<repo>/journal.md, tasks/<task>/<file>.md, lists/<name>.md). \
-             note_append for journals, note_get + note_put (with expected_version) \
-             for documents, note_delete to remove, note_list / note_search to find, \
-             note_history to recover, note_dump to export. Read notelet://guides/onboarding first."
+             Read notelet://guides/onboarding first; notelet://guides/tools lists every tool."
                 .into(),
         );
         info
@@ -720,26 +719,150 @@ mod tests {
         assert!(text_of(&found).contains("projects/x/journal.md"));
     }
 
-    #[test]
-    fn tool_router_lists_eight_tools() {
-        let names: Vec<String> = NoteletMcp::tool_router()
-            .list_all()
-            .into_iter()
-            .map(|t| t.name.to_string())
-            .collect();
-        for n in [
-            "note_get",
-            "note_put",
-            "note_append",
-            "note_delete",
-            "note_list",
-            "note_search",
-            "note_history",
-            "note_dump",
-        ] {
-            assert!(names.contains(&n.to_string()), "{n} missing from {names:?}");
+    /// Header of the generated guide; free of any count on purpose.
+    const TOOLS_GUIDE_HEAD: &str = "# Tools\n\nEvery tool the server offers, generated from the tool router. Run `just gen-docs` after changing a tool.\n\n";
+
+    /// The first sentence of a tool description, as one table cell. Cuts at
+    /// the first ". " outside backticks that is followed by an uppercase
+    /// letter, or at the final ".". Newlines become spaces and `|` is escaped.
+    fn first_sentence(desc: &str) -> String {
+        let flat = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let chars: Vec<(usize, char)> = flat.char_indices().collect();
+        let mut in_code = false;
+        let mut end = flat.len();
+        for (i, &(pos, c)) in chars.iter().enumerate() {
+            if c == '`' {
+                in_code = !in_code;
+            } else if c == '.' && !in_code {
+                match (chars.get(i + 1), chars.get(i + 2)) {
+                    (None, _) => {
+                        end = pos + 1;
+                        break;
+                    }
+                    (Some((_, ' ')), Some((_, n))) if n.is_uppercase() => {
+                        end = pos + 1;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
         }
-        assert_eq!(names.len(), 8);
+        flat[..end].trim().replace('|', "\\|")
+    }
+
+    #[test]
+    fn first_sentence_cuts_safely() {
+        assert_eq!(first_sentence("Read it. Then more."), "Read it.");
+        assert_eq!(
+            first_sentence("Use e.g. a path. Then more."),
+            "Use e.g. a path."
+        );
+        assert_eq!(first_sentence("Run `a. B` now. Next."), "Run `a. B` now.");
+        assert_eq!(first_sentence("Line one.\nLine two."), "Line one.");
+        assert_eq!(first_sentence("Line one.\r\nLine two."), "Line one.");
+        assert_eq!(first_sentence("A.\n\nB."), "A.");
+        assert_eq!(first_sentence("A.  B."), "A.");
+        assert_eq!(first_sentence("No end"), "No end");
+        assert_eq!(first_sentence("a | b. C"), "a \\| b.");
+    }
+
+    /// Markdown table of the tool router: one row per tool, sorted by name.
+    /// The "local only" column is empty until a tool has such parameters.
+    fn render_tool_table() -> String {
+        let mut tools = NoteletMcp::tool_router().list_all();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut out = String::from("| tool | does | local only |\n|---|---|---|\n");
+        for t in tools {
+            let desc = t.description.as_deref().unwrap_or("");
+            let cell = first_sentence(desc);
+            assert_eq!(
+                cell.matches('`').count() % 2,
+                0,
+                "unbalanced backticks in the first sentence of {}",
+                t.name
+            );
+            out.push_str(&format!("| `{}` | {} | |\n", t.name, cell));
+        }
+        out
+    }
+
+    /// Replace each file with its new content: write every `<file>.tmp`
+    /// first, then rename each onto its file. On any failure the `.tmp`
+    /// files are removed and the error returned.
+    fn replace_files(files: &[(&std::path::Path, &str)]) -> std::io::Result<()> {
+        let tmp_of = |path: &std::path::Path| {
+            let mut name = path.file_name().expect("file name").to_os_string();
+            name.push(".tmp");
+            path.with_file_name(name)
+        };
+        let result = (|| {
+            for (path, content) in files {
+                std::fs::write(tmp_of(path), content)?;
+            }
+            for (path, _) in files {
+                std::fs::rename(tmp_of(path), path)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            for (path, _) in files {
+                let _ = std::fs::remove_file(tmp_of(path));
+            }
+        }
+        result
+    }
+
+    /// Golden test: the guide file and the README block between the
+    /// markers equal the rendered table. `NOTELET_UPDATE_DOCS=1` rewrites
+    /// them; set it only through `just gen-docs`, never in a normal run.
+    #[test]
+    fn tool_docs_match_router() {
+        const BEGIN: &str = "<!-- tools:begin -->";
+        const END: &str = "<!-- tools:end -->";
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let guide_path = root.join("docs/guides/tools.md");
+        let readme_path = root.join("../../README.md");
+        let table = render_tool_table();
+        let guide = format!("{TOOLS_GUIDE_HEAD}{table}");
+        let readme = std::fs::read_to_string(&readme_path)
+            .expect("read README.md")
+            .replace("\r\n", "\n");
+        assert_eq!(
+            readme.matches(BEGIN).count(),
+            1,
+            "README.md needs exactly one begin marker"
+        );
+        assert_eq!(
+            readme.matches(END).count(),
+            1,
+            "README.md needs exactly one end marker"
+        );
+        let b = readme.find(BEGIN).unwrap() + BEGIN.len();
+        let e = readme.find(END).unwrap();
+        assert!(b <= e, "README.md markers are out of order");
+        let new_readme = format!("{}\n{}{}", &readme[..b], table, &readme[e..]);
+
+        if std::env::var("NOTELET_UPDATE_DOCS").as_deref() == Ok("1") {
+            replace_files(&[(&guide_path, &guide), (&readme_path, &new_readme)])
+                .expect("rewrite the generated docs");
+            eprintln!(
+                "rewrote {} and {}",
+                guide_path.display(),
+                readme_path.display()
+            );
+            return;
+        }
+        let on_disk = std::fs::read_to_string(&guide_path)
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
+        assert_eq!(
+            on_disk, guide,
+            "docs/guides/tools.md is out of date; run `just gen-docs`"
+        );
+        assert_eq!(
+            readme, new_readme,
+            "the tool table in README.md is out of date; run `just gen-docs`"
+        );
     }
 }
 

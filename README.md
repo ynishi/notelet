@@ -1,6 +1,6 @@
 # notelet
 
-A thin, hosted store for Markdown notes that coding agents read and write over MCP. One table of notes keyed by path, one append-only history table, optimistic locking, a filter that is a thin wrapper over SQL, and eight tools. Nothing else.
+A thin, hosted store for Markdown notes that coding agents read and write over MCP. One table of notes keyed by path, one append-only history table, optimistic locking, a filter that is a thin wrapper over SQL, and the tools listed below. Nothing else.
 
 ## Why
 
@@ -17,16 +17,20 @@ Page        limit (1..=1000; dump 1..=100) + exclusive keyset cursor
 
 Paths are slash-separated segments of `[A-Za-z0-9._-]`; the tree (`projects/<repo>/journal.md`, `tasks/<task>/...`, `lists/<name>.md`) is a naming convention served by the prefix listing, not a directory object.
 
-| tool | does |
-|---|---|
-| `note_get` | read one note with its version; `tail_lines` / `max_bytes` read only its end (`size`, `truncated` say it is partial) |
-| `note_put` | create or replace the whole body; `expected_version` must match or you get `Conflict` with `current_version`; an identical body is a no-op (`changed: false`) |
-| `note_append` | add a line at the end, no version needed (journals, or uploading a large body in chunks) |
-| `note_delete` | remove a note; its body stays readable through `note_history` |
-| `note_list` | metadata (size in bytes) under a prefix, filtered, paged |
-| `note_search` | case-insensitive substring over bodies, with a snippet |
-| `note_history` | bodies that `note_put` replaced or `note_delete` removed (`include_body: false` for metadata only) |
-| `note_dump` | paths and bodies under a prefix: a file tree, for backup or for leaving |
+The list is generated from the tool router (also served as `notelet://guides/tools`); run `just gen-docs` after changing a tool.
+
+<!-- tools:begin -->
+| tool | does | local only |
+|---|---|---|
+| `note_append` | Append text to the end of a note (created if missing), on its own line. | |
+| `note_delete` | Remove a note. | |
+| `note_dump` | Paths and full bodies under a prefix, ordered by path and paged: default 20, max 100 (bodies are heavy); pass next_cursor as cursor (exclusive). | |
+| `note_get` | Read one note: path, body (Markdown), version, updated_at, updated_by, size, truncated. | |
+| `note_history` | Bodies that note_put replaced or note_delete removed for this path, newest first (default 20, max 50). | |
+| `note_list` | List notes (path, version, updated_at, updated_by, size in bytes (UTF-8); no body) under a prefix, filtered by ANDed predicates {field, op, value}. | |
+| `note_put` | Create or replace a note's whole body with optimistic locking. | |
+| `note_search` | Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. | |
+<!-- tools:end -->
 
 Writes answer `{ path, version, updated_at, size, sha256, changed }` so a caller can verify a round trip without reading the body back.
 
