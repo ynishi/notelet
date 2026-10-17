@@ -1,0 +1,19 @@
+{
+  "name": "notelet",
+  "owner": {
+    "name": "Yutaka Nishimura"
+  },
+  "description": "Claude Code plugins for notelet, the thin Markdown note store for coding agents.",
+  "plugins": [
+    {
+      "name": "notelet-links",
+      "source": "./plugins/notelet-links",
+      "description": "Links to the notelet notes this session wrote, above the prompt and in /notes.",
+      "version": "0.1.0",
+      "license": "MIT OR Apache-2.0",
+      "homepage": "https://github.com/ynishi/notelet",
+      "repository": "https://github.com/ynishi/notelet",
+      "keywords": ["notelet", "notes", "mcp", "links"]
+    }
+  ]
+}

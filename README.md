@@ -143,12 +143,24 @@ On a note page every heading has an `id`, a `¶` link to it, and right after it 
 
 The view is a projection, not part of the model: it calls the same `get` / `list` / `search` the tools do, has no route that writes, and adds no tool. Raw HTML in a note is shown as text, links keep only `http`, `https`, `mailto` or relative URLs, images are shown as links rather than loaded, pages carry no script and no external asset, and every page is sent with `Cache-Control: no-store`.
 
+## Claude Code plugin
+
+`notelet-links` shows a link above the prompt to each note the session wrote, and `/notes` lists them. It runs on the client only.
+
+```
+/plugin marketplace add ynishi/notelet
+/plugin install notelet-links@notelet
+```
+
+See [plugins/notelet-links/README.md](plugins/notelet-links/README.md).
+
 ## Layout
 
 ```
 crates/notelet        umbrella: re-exports notelet-core under the project name (depend on this from library code)
 crates/notelet-core   domain, port (NoteRepo), service, Postgres adapter, in-memory adapter, migrations
 crates/notelet-mcp    the binary: config from env, bearer middleware, rmcp tools + resources, HTTP / stdio
+plugins/notelet-links Claude Code plugin: links to the notes a session wrote (client side only)
 ```
 
 Design notes are in the crate docs (`cargo doc --open`), starting at `notelet_core`. The code documentation is the design document; there is no separate one to drift.
