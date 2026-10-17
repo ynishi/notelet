@@ -17,6 +17,10 @@ test:
     cargo test -p notelet-mcp
     cargo test -p notelet
 
+# regenerate the tool list in README.md and docs/guides/tools.md
+gen-docs:
+    NOTELET_UPDATE_DOCS=1 cargo test -p notelet-mcp tool_docs_match_router -- --nocapture
+
 # Postgres integration test; needs NOTELET_TEST_DATABASE_URL
 test-pg:
     cargo test -p notelet-core --test pg -- --nocapture
