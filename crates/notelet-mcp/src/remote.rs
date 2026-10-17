@@ -88,12 +88,11 @@
 //!   the note was deleted in between, the read-back is
 //!   [`CoreError::NotFound`]. Every append downloads the whole body to
 //!   rebuild the `Note`, so on a long journal it costs a full read.
-//! * `delete` reads the note first, then deletes at exactly the version it
-//!   read (the caller's `expected` must equal it, else the conflict is
-//!   raised here without a call), so the returned body is the one removed.
-//!   A write between the two calls is a [`CoreError::VersionConflict`], also
-//!   when the caller passed `expected = None` (the conflict then reports
-//!   `expected: None`; there is no retry).
+//! * `delete` reads the note first (the caller's `expected` must equal the
+//!   version read, else the conflict is raised here without a call), then
+//!   deletes at `expected`, so the returned body is the one removed. A write
+//!   between the two calls is a [`CoreError::VersionConflict`] from the
+//!   remote; there is no retry.
 //!
 //! The extra reads make `append` and `delete` two round trips and not
 //! atomic with respect to other writers beyond what is described above.
@@ -329,22 +328,6 @@ fn absent<T>(r: Result<T, CoreError>) -> Result<Option<T>, CoreError> {
     }
 }
 
-/// `delete` sends the version it read, not the caller's. When the caller
-/// passed none, a conflict must say so (`expected: None`), not name our
-/// version.
-fn report_expected(e: CoreError, caller_expected: Option<i64>) -> CoreError {
-    match e {
-        CoreError::VersionConflict { path, current, .. } if caller_expected.is_none() => {
-            CoreError::VersionConflict {
-                path,
-                expected: None,
-                current,
-            }
-        }
-        e => e,
-    }
-}
-
 fn note_of(v: NoteView) -> Note {
     Note {
         path: v.path,
@@ -445,34 +428,26 @@ impl NoteRepo for RemoteNoteRepo {
         Ok(note_of(view))
     }
 
-    async fn delete(
-        &self,
-        path: &NotePath,
-        expected: Option<i64>,
-        _by: &str,
-    ) -> Result<Note, CoreError> {
+    async fn delete(&self, path: &NotePath, expected: i64, _by: &str) -> Result<Note, CoreError> {
         let note = self
             .get(path)
             .await?
             .ok_or_else(|| CoreError::NotFound(path.as_str().to_string()))?;
-        if let Some(e) = expected {
-            if e != note.version {
-                return Err(CoreError::VersionConflict {
-                    path: path.as_str().to_string(),
-                    expected,
-                    current: note.version,
-                });
-            }
+        if expected != note.version {
+            return Err(CoreError::VersionConflict {
+                path: path.as_str().to_string(),
+                expected: Some(expected),
+                current: note.version,
+            });
         }
         let _removed: WriteOutcome = self
             .call(
                 "note_delete",
-                json!({ "path": path.as_str(), "expected_version": note.version }),
+                json!({ "path": path.as_str(), "expected_version": expected }),
                 Some(path.as_str()),
-                Some(note.version),
+                Some(expected),
             )
-            .await
-            .map_err(|e| report_expected(e, expected))?;
+            .await?;
         Ok(note)
     }
 
@@ -671,7 +646,7 @@ mod tests {
 
         // a stale expected is refused without deleting
         assert!(matches!(
-            repo.delete(&p("n/d.md"), Some(7), "x").await,
+            repo.delete(&p("n/d.md"), 7, "x").await,
             Err(CoreError::VersionConflict {
                 expected: Some(7),
                 current: 1,
@@ -680,7 +655,7 @@ mod tests {
         ));
         assert!(repo.get(&p("n/d.md")).await.unwrap().is_some());
 
-        let gone = repo.delete(&p("n/d.md"), Some(1), "x").await.unwrap();
+        let gone = repo.delete(&p("n/d.md"), 1, "x").await.unwrap();
         assert_eq!(gone.body, "bye");
         assert_eq!(gone.version, 1);
         assert!(repo.get(&p("n/d.md")).await.unwrap().is_none());
@@ -692,15 +667,9 @@ mod tests {
         assert_eq!(hm[0].size, 3);
 
         assert!(matches!(
-            repo.delete(&p("n/d.md"), None, "x").await,
+            repo.delete(&p("n/d.md"), 1, "x").await,
             Err(CoreError::NotFound(_))
         ));
-        // no expected: deletes whatever is there
-        repo.put(&p("n/e.md"), "e", None, "x").await.unwrap();
-        assert_eq!(
-            repo.delete(&p("n/e.md"), None, "x").await.unwrap().body,
-            "e"
-        );
     }
 
     #[tokio::test]
@@ -1039,34 +1008,5 @@ mod tests {
         let e = decode_error(&failed("plain words"), None, None);
         assert!(matches!(e, CoreError::Storage(_)));
         assert!(e.chain().to_string().contains("plain words"));
-    }
-
-    #[test]
-    fn delete_conflict_reports_the_callers_expected() {
-        let c = || CoreError::VersionConflict {
-            path: "n/r.md".into(),
-            expected: Some(1),
-            current: 2,
-        };
-        assert!(matches!(
-            report_expected(c(), None),
-            CoreError::VersionConflict {
-                expected: None,
-                current: 2,
-                ..
-            }
-        ));
-        assert!(matches!(
-            report_expected(c(), Some(1)),
-            CoreError::VersionConflict {
-                expected: Some(1),
-                current: 2,
-                ..
-            }
-        ));
-        assert!(matches!(
-            report_expected(CoreError::NotFound("x".into()), None),
-            CoreError::NotFound(_)
-        ));
     }
 }

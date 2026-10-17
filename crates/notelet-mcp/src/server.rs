@@ -249,7 +249,9 @@ pub struct RestoreParams {
 pub struct DeleteParams {
     /// Note path.
     pub path: String,
-    /// The version you last read. Omit to delete whatever is there.
+    /// The version you last read. Required: the delete is refused if someone
+    /// wrote in between. (Declared optional only so that a call without it is
+    /// answered as `Validation` instead of a schema error.)
     pub expected_version: Option<i64>,
 }
 
@@ -765,7 +767,7 @@ impl NoteletMcp {
             idempotent_hint = true,
             open_world_hint = false
         ),
-        description = "Remove a note. Its body stays readable through note_history as the last revision. Pass expected_version to refuse if someone wrote in between; omit it to delete whatever is there. Answers the removed note's version, size and sha256."
+        description = "Remove a note. Its body stays readable through note_history as the last revision. Requires expected_version (the version you read; refused with Conflict if someone wrote in between). Answers the removed note's version, size and sha256."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_delete", path = %p.path, actor = tracing::field::Empty))]
     async fn note_delete(
@@ -774,7 +776,12 @@ impl NoteletMcp {
         ext: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.actor_of(&ext);
-        write_json(self.svc.delete(&p.path, p.expected_version, &actor).await)
+        let Some(expected) = p.expected_version else {
+            return Ok(refuse(
+                "note_delete needs expected_version: the version you last read (note_get)",
+            ));
+        };
+        write_json(self.svc.delete(&p.path, expected, &actor).await)
     }
 
     #[tool(
@@ -1389,6 +1396,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_without_expected_version_is_validation() {
+        let s = server();
+        put_note(&s, "n/d.md", "keep", None).await.unwrap();
+        let r = s
+            .note_delete(
+                Parameters(DeleteParams {
+                    path: "n/d.md".into(),
+                    expected_version: None,
+                }),
+                Extensions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert_eq!(body["kind"], "Validation");
+        assert!(s.svc.get("n/d.md").await.is_ok());
+    }
+
+    #[tokio::test]
     async fn delete_then_get_is_not_found_and_history_keeps_it() {
         let s = server();
         put_note(&s, "n/d.md", "bye", None).await.unwrap();
@@ -1962,7 +1989,7 @@ mod boundary_tests {
             &b,
             3,
             "note_delete",
-            json!({"path": "n/app.md"}),
+            json!({"path": "n/app.md", "expected_version": 1}),
         )
         .await;
         let hist = svc.history("n/app.md", None, false).await.unwrap();
@@ -2051,7 +2078,7 @@ mod boundary_tests {
         s.note_delete(
             Parameters(DeleteParams {
                 path: "n/d.md".into(),
-                expected_version: None,
+                expected_version: Some(1),
             }),
             ext,
         )

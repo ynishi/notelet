@@ -67,6 +67,30 @@ pub fn sql_like(pattern: &str, text: &str, case_insensitive: bool) -> bool {
     like_match(&p, &t)
 }
 
+/// Lowercase one char at a time with `char::to_lowercase`, so the result
+/// depends on no neighbouring char (unlike `str::to_lowercase`, which treats
+/// a final sigma specially). It is not guaranteed to equal Postgres `lower()`
+/// for every char (e.g. `\u{130}` becomes two chars here).
+fn lowercase_chars(s: &str) -> String {
+    s.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// Byte offset in `body` of the first char whose lowercase form starts a
+/// match of `needle` (already lowercased). Lowercasing can change the UTF-8
+/// length of a char, so an offset found in the lowercased text is mapped
+/// back to the original char it came from, never used on `body` directly.
+fn find_lowercase(body: &str, needle: &str) -> Option<usize> {
+    let mut lower = String::with_capacity(body.len());
+    let mut origin: Vec<usize> = Vec::with_capacity(body.len());
+    for (i, c) in body.char_indices() {
+        let before = lower.len();
+        lower.extend(c.to_lowercase());
+        origin.resize(origin.len() + (lower.len() - before), i);
+    }
+    let at = lower.find(needle)?;
+    Some(origin.get(at).copied().unwrap_or(body.len()))
+}
+
 fn like_match(p: &[char], t: &[char]) -> bool {
     match p.first() {
         None => t.is_empty(),
@@ -190,24 +214,17 @@ impl NoteRepo for MemoryNoteRepo {
         })
     }
 
-    async fn delete(
-        &self,
-        path: &NotePath,
-        expected: Option<i64>,
-        _by: &str,
-    ) -> Result<Note, CoreError> {
+    async fn delete(&self, path: &NotePath, expected: i64, _by: &str) -> Result<Note, CoreError> {
         let mut g = self.inner.lock().await;
         let Some(cur) = g.notes.get(path.as_str()).cloned() else {
             return Err(CoreError::NotFound(path.to_string()));
         };
-        if let Some(e) = expected {
-            if cur.version != e {
-                return Err(CoreError::VersionConflict {
-                    path: path.to_string(),
-                    expected: Some(e),
-                    current: cur.version,
-                });
-            }
+        if cur.version != expected {
+            return Err(CoreError::VersionConflict {
+                path: path.to_string(),
+                expected: Some(expected),
+                current: cur.version,
+            });
         }
         g.revisions.push(revision_of(cur.clone()));
         g.notes.remove(path.as_str());
@@ -266,12 +283,11 @@ impl NoteRepo for MemoryNoteRepo {
         prefix: &str,
         page: &Page,
     ) -> Result<PageOut<SearchHit>, CoreError> {
-        let needle = text.to_lowercase();
+        let needle = lowercase_chars(text);
         let g = self.inner.lock().await;
         let rows: Vec<SearchHit> = after_cursor(&g.notes, prefix, page.cursor.as_deref())
             .filter_map(|n| {
-                let lower = n.body.to_lowercase();
-                let at = lower.find(&needle)?;
+                let at = find_lowercase(&n.body, &needle)?;
                 let start = n.body[..at]
                     .char_indices()
                     .rev()
@@ -344,7 +360,7 @@ impl NoteRepo for MemoryNoteRepo {
 
 #[cfg(test)]
 mod tests {
-    use super::sql_like;
+    use super::*;
 
     #[test]
     fn like_semantics() {
@@ -355,5 +371,27 @@ mod tests {
         assert!(!sql_like("50\\%", "500", false));
         assert!(sql_like("PROJ%", "projects/x", true));
         assert!(!sql_like("PROJ%", "projects/x", false));
+    }
+
+    #[tokio::test]
+    async fn search_survives_a_char_whose_lowercase_is_longer() {
+        // U+023A is 2 bytes; its lowercase U+2C65 is 3, so offsets found in
+        // the lowercased body drift from the original's.
+        let repo = MemoryNoteRepo::default();
+        let path = NotePath::parse("n/u.md").unwrap();
+        let body = format!("{}needle after", "\u{23A}".repeat(100));
+        repo.put(&path, &body, None, "t").await.unwrap();
+        let page = Page::new(None, None).unwrap();
+        let hits = repo.search("NEEDLE", "", &page).await.unwrap();
+        assert_eq!(hits.items.len(), 1);
+        assert!(hits.items[0].snippet.contains("needle after"));
+        let hits = repo.search("\u{2C65}needle", "", &page).await.unwrap();
+        assert_eq!(hits.items.len(), 1);
+    }
+
+    #[test]
+    fn find_lowercase_maps_back_to_the_original_char() {
+        assert_eq!(find_lowercase("\u{23A}\u{23A}x", "x"), Some(4));
+        assert_eq!(find_lowercase("abc", "z"), None);
     }
 }
