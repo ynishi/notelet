@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `/ui/` | the top-level prefixes (`projects/`, `tasks/`, `lists/` and any other that exists), top-level notes, a search form |
 //! | `/ui/tree/{prefix}` | one page (100) of `list(prefix)`: path, size in bytes, updated_at; the prefixes directly below; `?cursor=` for the next page |
-//! | `/ui/note/{path}` | the note's body rendered from Markdown (see [`crate::render`]), with version, updated_at and size |
+//! | `/ui/note/{path}` | the note's body rendered from Markdown (see [`crate::render`]), with version, updated_at and size; the whole-note reference `notelet:<path>@v<version>`, and per heading an `id`, a `¶` link and the section reference (below) |
 //! | `/ui/search?q=&prefix=` | `search(q, prefix)` hits with snippets; an empty `q` shows only the form |
 //!
 //! Access: when tokens are configured, every `/ui` request needs HTTP Basic
@@ -20,6 +20,20 @@
 //! credential, so the view accepts only a loopback `Host` (see
 //! [`loopback_host`]) and answers `403` to anything else, the same guard
 //! against DNS rebinding that `/mcp` gets from rmcp's `allowed_hosts`.
+//!
+//! References: so a reader can tell an agent which part of which version they
+//! mean, the note page shows `notelet:<path>@v<version>` at the top and, next
+//! to each heading, `notelet:<path>@v<version>#L<first>-L<last> "<heading
+//! line>"` as a `<code class="ref">` with `user-select: all` (one click
+//! selects it). Lines are 1-based lines of the body as `note_get` returns it;
+//! a section runs from its heading to the line before the next heading of the
+//! same or a higher level (see [`crate::render::note_markdown`]). An agent
+//! resolves one with `note_get`; when the version has moved on it uses
+//! `note_history` for a version a `note_put` or `note_delete` replaced (a
+//! version moved on only by `note_append` is not in history, but appends only
+//! add lines at the end, so the range holds as given and the last section may
+//! now run longer; see `notelet://guides/onboarding`). It is plain text: no script,
+//! and the policy below is unchanged.
 //!
 //! Pages are plain HTML with inline CSS: no script, no external asset, a
 //! `Content-Security-Policy` that forbids both, and `Cache-Control:
@@ -43,7 +57,7 @@ use notelet_core::{CoreError, NoteService};
 use serde::Deserialize;
 
 use crate::auth::TokenTable;
-use crate::render::{escape, markdown, query_value};
+use crate::render::{escape, note_markdown, note_ref, query_value};
 
 /// Prefixes always offered on `/ui/`, whether or not anything is under them
 /// yet (the path convention from `notelet_core`).
@@ -249,14 +263,15 @@ async fn note(State(ui): State<Ui>, Path(path): Path<String>) -> Response {
     };
     let path = n.path.as_str();
     let body = format!(
-        r#"{crumbs}<h1>{path}</h1><p class="meta">version {version} · {updated} · {size} bytes · by {by}</p><article>{html}</article>"#,
+        r#"{crumbs}<h1>{path}</h1><p class="meta">version {version} · {updated} · {size} bytes · by {by}</p><p class="meta"><code class="ref">{whole}</code></p><article>{html}</article>"#,
         crumbs = crumbs(path),
         path = escape(path),
         version = n.version,
         updated = n.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
         size = n.body.len(),
         by = escape(&n.updated_by),
-        html = markdown(&n.body),
+        whole = escape(&note_ref(path, n.version)),
+        html = note_markdown(&n.body, path, n.version),
     );
     page(path, &body)
 }
@@ -405,7 +420,7 @@ fn error_page(e: CoreError) -> Response {
 const CSS: &str = "body{font:15px/1.55 system-ui,sans-serif;max-width:60rem;margin:0 auto;padding:1rem;color:#1d1d1f;background:#fff}\
 a{color:#0b57d0}nav{margin-bottom:.5rem}nav,.meta{color:#666;font-size:.9em}\
 table{border-collapse:collapse;width:100%}td,th{padding:.25rem .5rem;border-bottom:1px solid #ddd;text-align:left}.n{text-align:right}\
-pre{background:#f5f5f5;padding:.5rem;overflow-x:auto;white-space:pre-wrap}code{background:#f5f5f5}\
+pre{background:#f5f5f5;padding:.5rem;overflow-x:auto;white-space:pre-wrap}code{background:#f5f5f5}.ref{-webkit-user-select:all;user-select:all;font-size:.8rem;font-weight:normal}a.anchor{text-decoration:none;font-size:.8em}\
 article{border-top:1px solid #ddd;padding-top:.5rem}ul.hits{list-style:none;padding:0}form{margin:.5rem 0}\
 @media (prefers-color-scheme:dark){body{color:#e6e6e6;background:#151515}a{color:#8ab4f8}pre,code{background:#222}td,th,article{border-color:#333}}";
 
@@ -494,7 +509,7 @@ mod tests {
 
         let (s, body, r) = call(app(Some("secret")).await, "/ui/note/n/a.md", Some(GOOD)).await;
         assert_eq!(s, StatusCode::OK);
-        assert!(body.contains("<h1>Title</h1>"), "{body}");
+        assert!(body.contains(r#"<h1 id="title">Title "#), "{body}");
         assert!(body.contains("<strong>bold</strong>"), "{body}");
         assert!(body.contains("version 1"), "{body}");
         assert!(r.headers()[header::CONTENT_SECURITY_POLICY]
@@ -663,6 +678,48 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
         assert!(body.contains("&lt;script&gt;alert(2)"), "{body}");
+        assert!(!body.contains("<script"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn note_page_shows_references_with_the_version() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        svc.put("n/r.md", "# A\none\n## B\ntwo\n", None, "t")
+            .await
+            .unwrap();
+        svc.put("n/r.md", "# A\none\n## B\ntwo\nthree\n", Some(1), "t")
+            .await
+            .unwrap();
+        let (s, body, r) = call(router(svc, TokenTable::default()), "/ui/note/n/r.md", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(
+            body.contains(r#"<code class="ref">notelet:n/r.md@v2</code>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r###"<code class="ref">notelet:n/r.md@v2#L1-L5 "# A"</code>"###),
+            "{body}"
+        );
+        assert!(
+            body.contains(r###"<code class="ref">notelet:n/r.md@v2#L3-L5 "## B"</code>"###),
+            "{body}"
+        );
+        assert!(body.contains("user-select:all"), "{body}");
+        assert!(!body.contains("<script"), "{body}");
+        assert_eq!(
+            r.headers()[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        );
+    }
+
+    #[tokio::test]
+    async fn heading_with_raw_html_stays_escaped() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        svc.put("n/h.md", "## <script>alert(1)</script> \"q\"\n", None, "t")
+            .await
+            .unwrap();
+        let (_, body, _) = call(router(svc, TokenTable::default()), "/ui/note/n/h.md", None).await;
+        assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
         assert!(!body.contains("<script"), "{body}");
     }
 
