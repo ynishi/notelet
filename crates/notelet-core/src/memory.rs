@@ -381,7 +381,7 @@ mod tests {
         let path = NotePath::parse("n/u.md").unwrap();
         let body = format!("{}needle after", "\u{23A}".repeat(100));
         repo.put(&path, &body, None, "t").await.unwrap();
-        let page = Page::new(None, None);
+        let page = Page::new(None, None).unwrap();
         let hits = repo.search("NEEDLE", "", &page).await.unwrap();
         assert_eq!(hits.items.len(), 1);
         assert!(hits.items[0].snippet.contains("needle after"));

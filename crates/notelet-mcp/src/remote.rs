@@ -55,7 +55,7 @@
 //! keeping `current_version` and `expected_version`; `NotFound` ->
 //! [`CoreError::NotFound`] (naming the path asked for); `Validation` ->
 //! [`CoreError::InvalidPath`], [`CoreError::InvalidFilter`] or
-//! [`CoreError::InvalidTail`], told apart by the prefix of the message,
+//! [`CoreError::InvalidTail`] or [`CoreError::InvalidLimit`], told apart by the prefix of the message,
 //! which is the `Display` of the original error. Everything else (`Internal`,
 //! an unreadable answer, a transport or protocol failure, a closed
 //! connection) is [`CoreError::Storage`] whose `source()` is the cause
@@ -309,6 +309,8 @@ fn decode_error(r: &CallToolResult, path: Option<&str>, expected: Option<i64>) -
                 CoreError::InvalidFilter(m)
             } else if let Some(m) = strip("invalid tail: ") {
                 CoreError::InvalidTail(m)
+            } else if let Some(m) = strip("invalid limit: ") {
+                CoreError::InvalidLimit(m)
             } else {
                 CoreError::InvalidPath(strip("invalid path: ").unwrap_or(message))
             }
@@ -681,7 +683,7 @@ mod tests {
         repo.put(&p("other/z.md"), "z", None, "x").await.unwrap();
 
         let first = repo
-            .list("l/", &[], &Page::new(Some(2), None))
+            .list("l/", &[], &Page::new(Some(2), None).unwrap())
             .await
             .unwrap();
         let paths: Vec<_> = first.items.iter().map(|m| m.path.as_str()).collect();
@@ -689,25 +691,28 @@ mod tests {
         assert_eq!(first.next_cursor.as_deref(), Some("l/b.md"));
 
         let second = repo
-            .list("l/", &[], &Page::new(Some(2), first.next_cursor))
+            .list("l/", &[], &Page::new(Some(2), first.next_cursor).unwrap())
             .await
             .unwrap();
         let paths: Vec<_> = second.items.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(paths, ["l/c.md", "l/d.md"]);
 
         let last = repo
-            .list("l/", &[], &Page::new(Some(2), second.next_cursor))
+            .list("l/", &[], &Page::new(Some(2), second.next_cursor).unwrap())
             .await
             .unwrap();
         assert_eq!(last.items.len(), 1);
         assert!(last.next_cursor.is_none());
 
         let by = Filter::parse("updated_by", "eq", "alice").unwrap();
-        let all = repo.list("", &[by], &Page::new(None, None)).await.unwrap();
+        let all = repo
+            .list("", &[by], &Page::new(None, None).unwrap())
+            .await
+            .unwrap();
         assert_eq!(all.items.len(), 6);
         let since = Filter::parse("updated_at", "gt", "2999-01-01T00:00:00Z").unwrap();
         let none = repo
-            .list("", &[since], &Page::new(None, None))
+            .list("", &[since], &Page::new(None, None).unwrap())
             .await
             .unwrap();
         assert!(none.items.is_empty());
@@ -738,7 +743,8 @@ mod tests {
             .is_none());
         // a prefix that is not a path
         assert!(matches!(
-            repo.list("../x", &[], &Page::new(None, None)).await,
+            repo.list("../x", &[], &Page::new(None, None).unwrap())
+                .await,
             Err(CoreError::InvalidPath(_))
         ));
     }
@@ -751,7 +757,7 @@ mod tests {
             .unwrap();
         repo.put(&p("s/b.md"), "hay", None, "x").await.unwrap();
         let hits = repo
-            .search("needle", "s/", &Page::new(None, None))
+            .search("needle", "s/", &Page::new(None, None).unwrap())
             .await
             .unwrap();
         assert_eq!(hits.items.len(), 1);
@@ -759,12 +765,12 @@ mod tests {
         assert!(hits.items[0].snippet.contains("Needle"));
 
         let d = repo
-            .dump("s/", &Page::for_bodies(Some(1), None))
+            .dump("s/", &Page::for_bodies(Some(1), None).unwrap())
             .await
             .unwrap();
         assert_eq!(d.items[0].body, "The Needle here");
         let d2 = repo
-            .dump("s/", &Page::for_bodies(Some(1), d.next_cursor))
+            .dump("s/", &Page::for_bodies(Some(1), d.next_cursor).unwrap())
             .await
             .unwrap();
         assert_eq!(d2.items[0].body, "hay");
@@ -938,6 +944,7 @@ mod tests {
             (CoreError::InvalidPath("x".into()), "invalid path: "),
             (CoreError::InvalidFilter("x".into()), "invalid filter: "),
             (CoreError::InvalidTail("x".into()), "invalid tail: "),
+            (CoreError::InvalidLimit("x".into()), "invalid limit: "),
         ] {
             assert!(err.to_string().starts_with(prefix), "{err}");
         }
@@ -953,6 +960,10 @@ mod tests {
         assert!(matches!(
             decode_error(&v("invalid tail: bad"), None, None),
             CoreError::InvalidTail(m) if m == "bad"
+        ));
+        assert!(matches!(
+            decode_error(&v("invalid limit: bad"), None, None),
+            CoreError::InvalidLimit(m) if m == "bad"
         ));
 
         // conflict: current_version kept; expected from the answer, even null

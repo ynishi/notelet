@@ -490,14 +490,22 @@ impl Page {
     /// See [`Page::DEFAULT_BODY_LIMIT`].
     pub const MAX_BODY_LIMIT: u32 = 100;
 
-    /// Clamp `limit` into `1..=MAX_LIMIT` (default 100) and keep the cursor.
-    pub fn new(limit: Option<u32>, cursor: Option<String>) -> Self {
-        Self::capped(limit, cursor, Self::DEFAULT_LIMIT, Self::MAX_LIMIT)
+    /// Default and largest `limit` of a history read.
+    pub const DEFAULT_HISTORY_LIMIT: u32 = 20;
+    /// See [`Page::DEFAULT_HISTORY_LIMIT`].
+    pub const MAX_HISTORY_LIMIT: u32 = 50;
+
+    /// A page of `limit` (default 100) rows after `cursor`. A `limit` outside
+    /// `1..=MAX_LIMIT` is refused with [`CoreError::InvalidLimit`], not
+    /// clamped.
+    pub fn new(limit: Option<u32>, cursor: Option<String>) -> Result<Self, CoreError> {
+        Self::checked(limit, cursor, Self::DEFAULT_LIMIT, Self::MAX_LIMIT)
     }
 
-    /// Clamp `limit` into `1..=MAX_BODY_LIMIT` (default 20); for `dump`.
-    pub fn for_bodies(limit: Option<u32>, cursor: Option<String>) -> Self {
-        Self::capped(
+    /// Like [`Page::new`] for operations that return bodies (`dump`): default
+    /// 20, `1..=MAX_BODY_LIMIT`.
+    pub fn for_bodies(limit: Option<u32>, cursor: Option<String>) -> Result<Self, CoreError> {
+        Self::checked(
             limit,
             cursor,
             Self::DEFAULT_BODY_LIMIT,
@@ -505,9 +513,31 @@ impl Page {
         )
     }
 
-    fn capped(limit: Option<u32>, cursor: Option<String>, default: u32, max: u32) -> Self {
-        let limit = limit.unwrap_or(default).clamp(1, max);
-        Self { limit, cursor }
+    fn checked(
+        limit: Option<u32>,
+        cursor: Option<String>,
+        default: u32,
+        max: u32,
+    ) -> Result<Self, CoreError> {
+        Ok(Self {
+            limit: Self::check_limit(limit, default, max)?,
+            cursor,
+        })
+    }
+
+    /// `limit` or `default`, refused unless within `1..=max`.
+    pub(crate) fn check_limit(
+        limit: Option<u32>,
+        default: u32,
+        max: u32,
+    ) -> Result<u32, CoreError> {
+        match limit {
+            None => Ok(default),
+            Some(n) if (1..=max).contains(&n) => Ok(n),
+            Some(n) => Err(CoreError::InvalidLimit(format!(
+                "limit must be between 1 and {max}, got {n}"
+            ))),
+        }
     }
 }
 
@@ -733,10 +763,21 @@ mod tests {
     }
 
     #[test]
-    fn page_clamps_limit() {
-        assert_eq!(Page::new(None, None).limit, Page::DEFAULT_LIMIT);
-        assert_eq!(Page::new(Some(0), None).limit, 1);
-        assert_eq!(Page::new(Some(5000), None).limit, Page::MAX_LIMIT);
+    fn page_rejects_out_of_range_limit() {
+        assert_eq!(Page::new(None, None).unwrap().limit, Page::DEFAULT_LIMIT);
+        assert_eq!(Page::new(Some(1), None).unwrap().limit, 1);
+        assert_eq!(
+            Page::new(Some(Page::MAX_LIMIT), None).unwrap().limit,
+            Page::MAX_LIMIT
+        );
+        assert!(matches!(
+            Page::new(Some(0), None),
+            Err(CoreError::InvalidLimit(_))
+        ));
+        assert!(matches!(
+            Page::new(Some(Page::MAX_LIMIT + 1), None),
+            Err(CoreError::InvalidLimit(_))
+        ));
     }
 
     #[test]
@@ -751,11 +792,20 @@ mod tests {
 
     #[test]
     fn body_page_is_smaller() {
-        assert_eq!(Page::for_bodies(None, None).limit, Page::DEFAULT_BODY_LIMIT);
         assert_eq!(
-            Page::for_bodies(Some(999), None).limit,
+            Page::for_bodies(None, None).unwrap().limit,
+            Page::DEFAULT_BODY_LIMIT
+        );
+        assert_eq!(
+            Page::for_bodies(Some(Page::MAX_BODY_LIMIT), None)
+                .unwrap()
+                .limit,
             Page::MAX_BODY_LIMIT
         );
+        assert!(matches!(
+            Page::for_bodies(Some(Page::MAX_BODY_LIMIT + 1), None),
+            Err(CoreError::InvalidLimit(_))
+        ));
     }
 
     #[test]

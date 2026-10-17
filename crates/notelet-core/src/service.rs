@@ -121,7 +121,7 @@ impl NoteService {
             .iter()
             .map(|f| Filter::parse(&f.field, &f.op, &f.value))
             .collect::<Result<Vec<_>, _>>()?;
-        let page = Page::new(limit, cursor);
+        let page = Page::new(limit, cursor)?;
         self.repo.list(prefix, &filters, &page).await
     }
 
@@ -138,11 +138,12 @@ impl NoteService {
         }
         let prefix = prefix.unwrap_or("");
         validate_prefix(prefix)?;
-        let page = Page::new(limit, cursor);
+        let page = Page::new(limit, cursor)?;
         self.repo.search(text, prefix, &page).await
     }
 
-    /// Replaced (or deleted) bodies of a note, newest first (at most 50),
+    /// Replaced (or deleted) bodies of a note, newest first (`limit` in `1..=50`,
+    /// default 20; out of range is refused with [`CoreError::InvalidLimit`]),
     /// with or without the bodies themselves.
     pub async fn history(
         &self,
@@ -151,7 +152,7 @@ impl NoteService {
         include_body: bool,
     ) -> Result<History, CoreError> {
         let path = NotePath::parse(path)?;
-        let limit = limit.unwrap_or(20).clamp(1, 50);
+        let limit = Page::check_limit(limit, Page::DEFAULT_HISTORY_LIMIT, Page::MAX_HISTORY_LIMIT)?;
         Ok(if include_body {
             History::Full(self.repo.history(&path, limit).await?)
         } else {
@@ -169,7 +170,7 @@ impl NoteService {
     ) -> Result<PageOut<DumpEntry>, CoreError> {
         let prefix = prefix.unwrap_or("");
         validate_prefix(prefix)?;
-        let page = Page::for_bodies(limit, cursor);
+        let page = Page::for_bodies(limit, cursor)?;
         self.repo.dump(prefix, &page).await
     }
 }
@@ -189,6 +190,39 @@ mod tests {
             op: op.into(),
             value: value.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn out_of_range_limits_are_refused_not_clamped() {
+        let s = svc();
+        s.put("n/a.md", "x", None, "t").await.unwrap();
+        assert!(matches!(
+            s.list(None, &[], Some(0), None).await,
+            Err(CoreError::InvalidLimit(_))
+        ));
+        assert!(matches!(
+            s.list(None, &[], Some(1001), None).await,
+            Err(CoreError::InvalidLimit(_))
+        ));
+        assert!(s.list(None, &[], Some(1000), None).await.is_ok());
+        assert!(matches!(
+            s.search("x", None, Some(1001), None).await,
+            Err(CoreError::InvalidLimit(_))
+        ));
+        assert!(matches!(
+            s.dump(None, Some(101), None).await,
+            Err(CoreError::InvalidLimit(_))
+        ));
+        assert!(s.dump(None, Some(100), None).await.is_ok());
+        assert!(matches!(
+            s.history("n/a.md", Some(51), true).await,
+            Err(CoreError::InvalidLimit(_))
+        ));
+        assert!(matches!(
+            s.history("n/a.md", Some(0), true).await,
+            Err(CoreError::InvalidLimit(_))
+        ));
+        assert!(s.history("n/a.md", Some(50), true).await.is_ok());
     }
 
     #[tokio::test]

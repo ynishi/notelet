@@ -51,6 +51,11 @@ async fn get_to(s: &NoteletMcp, path: &str, to: &str) -> CallToolResult {
     .unwrap()
 }
 
+/// A wire string as the enum it names; panics on a string the schema does not allow.
+fn wire<T: serde::de::DeserializeOwned>(s: &str) -> T {
+    serde_json::from_value(serde_json::Value::String(s.into())).unwrap()
+}
+
 async fn put(
     s: &NoteletMcp,
     body: Option<&str>,
@@ -64,7 +69,7 @@ async fn put(
             body: body.map(Into::into),
             from_file: from.map(Into::into),
             expected_version: expected,
-            on_conflict: on_conflict.map(Into::into),
+            on_conflict: on_conflict.map(wire),
         }),
         Extensions::default(),
     )
@@ -75,7 +80,7 @@ async fn put(
 async fn restore(s: &NoteletMcp, file: &str, source: &str) -> CallToolResult {
     s.note_restore(Parameters(RestoreParams {
         file: file.into(),
-        source: source.into(),
+        source: wire(source),
     }))
     .await
     .unwrap()
@@ -201,11 +206,17 @@ async fn body_and_from_file_are_exclusive_and_on_conflict_needs_a_file() {
         put(&f.s, Some("a"), Some("w.md"), None, None).await,
         put(&f.s, None, None, None, None).await,
         put(&f.s, Some("a"), None, None, Some("mark")).await,
-        put(&f.s, None, Some("w.md"), None, Some("merge")).await,
     ] {
         assert_eq!(err(&r)["kind"], "Validation");
     }
     assert!(f.svc.get(P).await.is_err(), "nothing was written");
+}
+
+#[test]
+fn on_conflict_other_than_fail_or_mark_does_not_deserialize() {
+    assert!(serde_json::from_value::<OnConflict>(serde_json::json!("merge")).is_err());
+    assert_eq!(wire::<OnConflict>("fail"), OnConflict::Fail);
+    assert_eq!(wire::<OnConflict>("mark"), OnConflict::Mark);
 }
 
 #[tokio::test]
@@ -523,8 +534,9 @@ async fn restore_on_a_malformed_file_errors_and_leaves_it_alone() {
         assert_eq!(read(&f, &name), *bad);
     }
     std::fs::write(f.dir.join("ok.md"), &good).unwrap();
-    let e = err(&restore(&f.s, "ok.md", "mine").await);
-    assert_eq!(e["kind"], "Validation");
+    // a source outside ours / theirs / base does not deserialize, so the
+    // handler is never reached
+    assert!(serde_json::from_value::<RestoreSource>(serde_json::json!("mine")).is_err());
     assert_eq!(read(&f, "ok.md"), good);
     let e = err(&restore(&f.s, "nothing.md", "ours").await);
     assert_eq!(e["kind"], "File");

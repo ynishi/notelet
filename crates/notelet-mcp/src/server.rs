@@ -18,6 +18,42 @@
 //! call with no such actor, i.e. over stdio or on a loopback `serve`
 //! without tokens, writes as the configured fallback (`NOTELET_ACTOR`).
 //!
+//! # What `tools/list` declares
+//!
+//! Every tool carries annotations, because the MCP defaults (not read-only,
+//! destructive, not idempotent, open world) would announce even `note_get`
+//! as a destructive tool that reaches the outside world. All tools set
+//! `openWorldHint: false` (the store is closed). `note_list`, `note_search`,
+//! `note_history`, `note_dump` and `note_get` are `readOnlyHint: true`;
+//! `note_put`, `note_restore` and `note_delete` are `destructiveHint: true`
+//! and `idempotentHint: true`; `note_append` is `destructiveHint: false` and
+//! `idempotentHint: false`. In local mode `note_get` can write `to_file`, so
+//! [`NoteletMcp::router_for`] replaces its annotations there by the
+//! destructive, idempotent set.
+//!
+//! The input schemas carry what the tools accept: the fixed-value fields
+//! (`note_put.on_conflict`, `note_restore.source`, the `field` and `op` of a
+//! `note_list` filter) are enums, so the schema has `enum` and a value outside
+//! it fails at parameter parsing, and each `limit` has `minimum` / `maximum`
+//! (`1..=1000`; `note_dump` `1..=100`; `note_history` `1..=50`). A `limit`
+//! outside the range that still reaches the service is refused with
+//! `kind: "Validation"`; it is never clamped. A value outside an enum
+//! (`on_conflict`, `source`, a filter `field` or `op`) never reaches a tool:
+//! rmcp answers it as an invalid-params protocol error (-32602, "failed to
+//! deserialize parameters: ..."), not as a tool result with `kind: "Validation"`.
+//!
+//! # Why a result is one JSON text block
+//!
+//! A tool answers a single text content block holding the JSON, with no
+//! `outputSchema` and no `structuredContent`. `outputSchema` is optional in
+//! the MCP specification (2026-07-28); every client reads text content,
+//! several ignore `structuredContent`, and others drop the text when
+//! `structuredContent` is present, so adding it would make some clients see
+//! less than they see now. What a structured result means is also still being
+//! revised upstream. Revisit when the specification settles on a client
+//! returning one or the other (at that point declare `outputSchema` from the
+//! result types and return both forms).
+//!
 //! # Local mode
 //!
 //! Local mode adds a file projection (see [`crate::files`] for the file
@@ -85,6 +121,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Extensions, ListResourcesResult, PaginatedRequestParams,
     ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig,
+    ToolAnnotations,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -160,7 +197,41 @@ pub struct PutParams {
     /// The version you last read. Omit to create a note that must not exist yet.
     pub expected_version: Option<i64>,
     /// Local mode only, with `from_file`: `"fail"` (default) or `"mark"`.
-    pub on_conflict: Option<String>,
+    pub on_conflict: Option<OnConflict>,
+}
+
+/// What `note_put` does with a file on a `Conflict` (`on_conflict`). The
+/// variants carry `//` comments, not doc comments: a doc comment makes
+/// schemars emit `oneOf`/`const` instead of the plain `enum` clients expect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum OnConflict {
+    // Only report the conflict (the default).
+    Fail,
+    // Also rewrite the file into ours / base / theirs.
+    Mark,
+}
+
+/// The section `note_restore` writes back (`source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RestoreSource {
+    // Your file, as it was before marking.
+    Ours,
+    // The note's body at the time of the conflict.
+    Theirs,
+    // The version you had read.
+    Base,
+}
+
+impl RestoreSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ours => "ours",
+            Self::Theirs => "theirs",
+            Self::Base => "base",
+        }
+    }
 }
 
 /// `note_restore` input (local mode only).
@@ -170,7 +241,7 @@ pub struct RestoreParams {
     /// relative to the file root.
     pub file: String,
     /// Which section to restore: `"ours"`, `"theirs"` or `"base"`.
-    pub source: String,
+    pub source: RestoreSource,
 }
 
 /// `note_delete` input.
@@ -197,11 +268,59 @@ pub struct AppendParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FilterParam {
     /// `path` | `updated_at` | `updated_by`
-    pub field: String,
+    pub field: FilterField,
     /// `eq` | `ne` | `like` | `ilike` | `gt` | `lt` | `gte` | `lte`
-    pub op: String,
+    pub op: FilterOp,
     /// Compared as text; as RFC 3339 for `updated_at`; as a LIKE pattern for `like` / `ilike`.
     pub value: String,
+}
+
+/// The fields `note_list` can filter on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterField {
+    Path,
+    UpdatedAt,
+    UpdatedBy,
+}
+
+impl FilterField {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::UpdatedAt => "updated_at",
+            Self::UpdatedBy => "updated_by",
+        }
+    }
+}
+
+/// The comparison operators of a `note_list` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Like,
+    Ilike,
+    Gt,
+    Lt,
+    Gte,
+    Lte,
+}
+
+impl FilterOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Like => "like",
+            Self::Ilike => "ilike",
+            Self::Gt => "gt",
+            Self::Lt => "lt",
+            Self::Gte => "gte",
+            Self::Lte => "lte",
+        }
+    }
 }
 
 /// `note_list` input.
@@ -212,7 +331,8 @@ pub struct ListParams {
     pub prefix: Option<String>,
     /// Predicates, ANDed.
     pub filters: Option<Vec<FilterParam>>,
-    /// Page size, 1..=1000 (default 100).
+    /// Page size, 1..=1000 (default 100); outside the range is refused.
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<u32>,
     /// `next_cursor` from the previous page (exclusive: the page starts
     /// strictly after that path).
@@ -226,7 +346,8 @@ pub struct SearchParams {
     pub text: String,
     /// Only paths starting with this.
     pub prefix: Option<String>,
-    /// Page size, 1..=1000 (default 100).
+    /// Page size, 1..=1000 (default 100); outside the range is refused.
+    #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<u32>,
     /// `next_cursor` from the previous page (exclusive: the page starts
     /// strictly after that path).
@@ -238,7 +359,8 @@ pub struct SearchParams {
 pub struct HistoryParams {
     /// Note path.
     pub path: String,
-    /// How many replaced or deleted bodies, newest first, 1..=50 (default 20).
+    /// How many replaced or deleted bodies, newest first, 1..=50 (default 20); outside the range is refused.
+    #[schemars(range(min = 1, max = 50))]
     pub limit: Option<u32>,
     /// Include each revision's body (default true). `false` returns only
     /// path, version, updated_at, updated_by and size (bytes, UTF-8).
@@ -251,7 +373,8 @@ pub struct HistoryParams {
 pub struct DumpParams {
     /// Only paths starting with this. Empty = everything.
     pub prefix: Option<String>,
-    /// Page size, 1..=100 (default 20): every item carries a body.
+    /// Page size, 1..=100 (default 20): every item carries a body; outside the range is refused.
+    #[schemars(range(min = 1, max = 100))]
     pub limit: Option<u32>,
     /// `next_cursor` from the previous page (exclusive: the page starts
     /// strictly after that path).
@@ -315,9 +438,10 @@ fn conflict_fields(
 fn core_error(err: CoreError) -> CallToolResult {
     let kind = match &err {
         CoreError::NotFound(_) => "NotFound",
-        CoreError::InvalidPath(_) | CoreError::InvalidFilter(_) | CoreError::InvalidTail(_) => {
-            "Validation"
-        }
+        CoreError::InvalidPath(_)
+        | CoreError::InvalidFilter(_)
+        | CoreError::InvalidTail(_)
+        | CoreError::InvalidLimit(_) => "Validation",
         CoreError::VersionConflict { .. } => "Conflict",
         CoreError::Contended { .. } | CoreError::Storage(_) => "Internal",
         _ => "Internal",
@@ -341,8 +465,8 @@ fn filters(input: Option<Vec<FilterParam>>) -> Vec<FilterInput> {
         .unwrap_or_default()
         .into_iter()
         .map(|f| FilterInput {
-            field: f.field,
-            op: f.op,
+            field: f.field.as_str().into(),
+            op: f.op.as_str().into(),
             value: f.value,
         })
         .collect()
@@ -407,6 +531,16 @@ impl NoteletMcp {
                     route.attr.description = Some(format!("{d} {note}").into());
                 }
             }
+            // `to_file` makes `note_get` a writer (of a local file).
+            if let Some(route) = router.map.get_mut("note_get") {
+                route.attr.annotations = Some(
+                    ToolAnnotations::new()
+                        .read_only(false)
+                        .destructive(true)
+                        .idempotent(true)
+                        .open_world(false),
+                );
+            }
             if let Some(route) = router.map.get_mut("note_put") {
                 edit_properties(&mut route.attr, |props| {
                     if let Some(serde_json::Value::String(d)) =
@@ -424,6 +558,17 @@ impl NoteletMcp {
                         props.remove(*name);
                     }
                 });
+                // the enum of a removed parameter must not stay behind in $defs
+                let schema = Arc::make_mut(&mut route.attr.input_schema);
+                if let Some(defs) = schema
+                    .get_mut("$defs")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    defs.remove("OnConflict");
+                    if defs.is_empty() {
+                        schema.remove("$defs");
+                    }
+                }
             }
             if let Some(route) = router.map.get_mut("note_put") {
                 let schema = Arc::make_mut(&mut route.attr.input_schema);
@@ -456,6 +601,7 @@ impl NoteletMcp {
     }
 
     #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
         description = "Read one note: path, body (Markdown), version, updated_at, updated_by, size, truncated. Optional tail_lines (>= 1) returns only the last N lines and max_bytes (>= 1) caps the bytes returned, cut on a line start where possible; use them to read the end of a long journal. size is the whole body in bytes (as note_list reports it) and truncated=true means body is only the end of the note. Keep the version if you intend to note_put, but NEVER note_put a body returned with truncated=true: it would replace the whole note with the fragment (to add to a journal use note_append)."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_get", path = %p.path))]
@@ -502,6 +648,12 @@ impl NoteletMcp {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Create or replace a note's whole body with optimistic locking. Omit expected_version to create (fails with kind=Conflict if it exists); pass the version you read to replace (fails with kind=Conflict and current_version if someone wrote in between — re-read, merge, retry). The replaced body is kept in history. A body identical to the current one changes nothing (changed=false). Returns path, version, updated_at, size (bytes, UTF-8), sha256, changed."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_put", path = %p.path, actor = tracing::field::Empty))]
@@ -511,18 +663,7 @@ impl NoteletMcp {
         ext: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.actor_of(&ext);
-        let mark = match p.on_conflict.as_deref() {
-            None | Some("fail") => false,
-            Some("mark") => true,
-            Some(other) => {
-                if self.files.is_none() {
-                    return Ok(not_local("on_conflict"));
-                }
-                return Ok(refuse(format!(
-                    "on_conflict must be \"fail\" or \"mark\", not {other:?}"
-                )));
-            }
-        };
+        let mark = p.on_conflict == Some(OnConflict::Mark);
         let root = self.files.as_deref();
         if root.is_none() {
             for (given, name) in [
@@ -573,6 +714,12 @@ impl NoteletMcp {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Rewrite a conflict file (written by note_put with on_conflict=\"mark\") to one section's body, exactly as it was before marking; local mode only. Pass source as \"ours\" (your file), \"theirs\" (the note's body at the time of the conflict) or \"base\" (the version you had read). Answers file, source, expected_version (the theirs version: pass it to the next note_put) and section_version (the version the restored body belongs to: theirs or base; null for ours). Restoring ours and putting overwrites theirs, as git checkout --ours does; restoring theirs and editing keeps their work. A file that is not a well-formed conflict file, whose line counts do not match, or that has no such section, is an error and stays unchanged. Unlike git there is no merge and no stored state: the markers in the file are all there is."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_restore", file = %p.file))]
@@ -583,10 +730,10 @@ impl NoteletMcp {
         let Some(root) = self.files.as_deref() else {
             return Ok(not_local(LOCAL_ONLY_TOOL));
         };
-        match files::restore(root, &p.file, &p.source) {
+        match files::restore(root, &p.file, p.source.as_str()) {
             Ok(r) => ok_json(&serde_json::json!({
                 "file": p.file,
-                "source": p.source,
+                "source": p.source.as_str(),
                 "expected_version": r.expected_version,
                 "section_version": r.section_version,
             })),
@@ -595,6 +742,12 @@ impl NoteletMcp {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
         description = "Append text to the end of a note (created if missing), on its own line. No version needed: an append cannot overwrite anyone. Use this for journals; it is also the way to upload a large body in chunks: the first append creates the note. Returns path, version, updated_at, size (bytes, UTF-8), sha256, changed."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_append", path = %p.path, actor = tracing::field::Empty))]
@@ -608,6 +761,12 @@ impl NoteletMcp {
     }
 
     #[tool(
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
         description = "Remove a note. Its body stays readable through note_history as the last revision. Requires expected_version (the version you read; refused with Conflict if someone wrote in between). Answers the removed note's version, size and sha256."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_delete", path = %p.path, actor = tracing::field::Empty))]
@@ -626,7 +785,8 @@ impl NoteletMcp {
     }
 
     #[tool(
-        description = "List notes (path, version, updated_at, updated_by, size in bytes (UTF-8); no body) under a prefix, filtered by ANDed predicates {field, op, value}. Fields: path, updated_at, updated_by. Ops: eq ne like ilike gt lt gte lte. Ordered by path; pass next_cursor as cursor to page (exclusive: the page starts strictly after that path). Default 100, max 1000. See notelet://guides/filters."
+        annotations(read_only_hint = true, open_world_hint = false),
+        description = "List notes (path, version, updated_at, updated_by, size in bytes (UTF-8); no body) under a prefix, filtered by ANDed predicates {field, op, value}. Fields: path, updated_at, updated_by. Ops: eq ne like ilike gt lt gte lte. Ordered by path; pass next_cursor as cursor to page (exclusive: the page starts strictly after that path). Default 100, max 1000; a limit outside 1..=1000 is refused (kind=Validation), not clamped. See notelet://guides/filters."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_list", prefix = ?p.prefix))]
     async fn note_list(
@@ -644,7 +804,8 @@ impl NoteletMcp {
     }
 
     #[tool(
-        description = "Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. Returns path, a snippet around the first hit, updated_at. Ordered by path; paged by next_cursor (exclusive: the page starts strictly after that path)."
+        annotations(read_only_hint = true, open_world_hint = false),
+        description = "Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. Returns path, a snippet around the first hit, updated_at. Ordered by path; paged by next_cursor (exclusive: the page starts strictly after that path). Default limit 100, max 1000; a limit outside the range is refused (kind=Validation)."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_search", prefix = ?p.prefix))]
     async fn note_search(
@@ -662,7 +823,8 @@ impl NoteletMcp {
     }
 
     #[tool(
-        description = "Bodies that note_put replaced or note_delete removed for this path, newest first (default 20, max 50). Appends do not create history. include_body=false returns only path, version, updated_at, updated_by, size (bytes, UTF-8)."
+        annotations(read_only_hint = true, open_world_hint = false),
+        description = "Bodies that note_put replaced or note_delete removed for this path, newest first (default 20, max 50; a limit outside 1..=50 is refused with kind=Validation). Appends do not create history. include_body=false returns only path, version, updated_at, updated_by, size (bytes, UTF-8)."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_history", path = %p.path))]
     async fn note_history(
@@ -681,7 +843,8 @@ impl NoteletMcp {
     }
 
     #[tool(
-        description = "Paths and full bodies under a prefix, ordered by path and paged: default 20, max 100 (bodies are heavy); pass next_cursor as cursor (exclusive). For backups, exports, or leaving notelet: the result is a file tree."
+        annotations(read_only_hint = true, open_world_hint = false),
+        description = "Paths and full bodies under a prefix, ordered by path and paged: default 20, max 100 (bodies are heavy; a limit outside 1..=100 is refused with kind=Validation); pass next_cursor as cursor (exclusive). For backups, exports, or leaving notelet: the result is a file tree."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_dump", prefix = ?p.prefix))]
     async fn note_dump(
@@ -942,6 +1105,195 @@ mod tests {
         assert!(body["message"].as_str().unwrap().contains("db down"));
     }
 
+    fn tool(local: bool, name: &str) -> rmcp::model::Tool {
+        NoteletMcp::router_for(local)
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("no tool {name}"))
+    }
+
+    /// `(read_only, destructive, idempotent, open_world)` of a tool.
+    fn hints(local: bool, name: &str) -> [Option<bool>; 4] {
+        let a = tool(local, name).annotations.expect("annotations");
+        [
+            a.read_only_hint,
+            a.destructive_hint,
+            a.idempotent_hint,
+            a.open_world_hint,
+        ]
+    }
+
+    #[test]
+    fn tools_list_carries_annotations() {
+        let (t, f) = (Some(true), Some(false));
+        for local in [false, true] {
+            for name in ["note_list", "note_search", "note_history", "note_dump"] {
+                assert_eq!(hints(local, name), [t, None, None, f], "{name}");
+            }
+            for name in ["note_put", "note_delete"] {
+                assert_eq!(hints(local, name), [f, t, t, f], "{name}");
+            }
+            assert_eq!(hints(local, "note_append"), [f, f, f, f]);
+        }
+        assert_eq!(hints(true, "note_restore"), [f, t, t, f]);
+        // note_get reads on the public router and writes `to_file` on the local one
+        assert_eq!(hints(false, "note_get"), [t, None, None, f]);
+        assert_eq!(hints(true, "note_get"), [f, t, t, f]);
+    }
+
+    /// The schema of `$defs.<def>` or of the property itself.
+    fn defs(t: &rmcp::model::Tool) -> serde_json::Value {
+        t.input_schema
+            .get("$defs")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    #[test]
+    fn tools_list_schemas_carry_enums_and_ranges() {
+        let list = tool(false, "note_list");
+        let d = defs(&list);
+        assert_eq!(
+            d["FilterField"]["enum"],
+            serde_json::json!(["path", "updated_at", "updated_by"])
+        );
+        assert_eq!(
+            d["FilterOp"]["enum"],
+            serde_json::json!(["eq", "ne", "like", "ilike", "gt", "lt", "gte", "lte"])
+        );
+        assert_eq!(
+            d["FilterParam"]["properties"]["field"]["$ref"],
+            "#/$defs/FilterField"
+        );
+        let local_put = tool(true, "note_put");
+        assert_eq!(
+            defs(&local_put)["OnConflict"]["enum"],
+            serde_json::json!(["fail", "mark"])
+        );
+        assert_eq!(
+            defs(&tool(true, "note_restore"))["RestoreSource"]["enum"],
+            serde_json::json!(["ours", "theirs", "base"])
+        );
+        // the public router has no on_conflict, so no enum for it either
+        assert!(defs(&tool(false, "note_put")).get("OnConflict").is_none());
+
+        for (name, max) in [
+            ("note_list", 1000),
+            ("note_search", 1000),
+            ("note_history", 50),
+            ("note_dump", 100),
+        ] {
+            let limit = &tool(false, name).input_schema["properties"]["limit"];
+            assert_eq!(limit["minimum"], 1, "{name}");
+            assert_eq!(limit["maximum"], max, "{name}");
+        }
+    }
+
+    /// The schema enums and the core parsers name the same fields and ops.
+    /// The exhaustive matches on the core types stop compiling when the core
+    /// gains a variant, so the schema cannot silently fall behind.
+    #[test]
+    fn filter_enums_round_trip_through_the_core_parsers() {
+        use notelet_core::{Field, Op};
+        for v in [
+            FilterField::Path,
+            FilterField::UpdatedAt,
+            FilterField::UpdatedBy,
+        ] {
+            let core = Field::parse(v.as_str()).unwrap();
+            let back = match core {
+                Field::Path => FilterField::Path,
+                Field::UpdatedAt => FilterField::UpdatedAt,
+                Field::UpdatedBy => FilterField::UpdatedBy,
+            };
+            assert_eq!(back, v);
+            assert_eq!(core.column(), v.as_str());
+        }
+        for v in [
+            FilterOp::Eq,
+            FilterOp::Ne,
+            FilterOp::Like,
+            FilterOp::Ilike,
+            FilterOp::Gt,
+            FilterOp::Lt,
+            FilterOp::Gte,
+            FilterOp::Lte,
+        ] {
+            let back = match Op::parse(v.as_str()).unwrap() {
+                Op::Eq => FilterOp::Eq,
+                Op::Ne => FilterOp::Ne,
+                Op::Like => FilterOp::Like,
+                Op::ILike => FilterOp::Ilike,
+                Op::Gt => FilterOp::Gt,
+                Op::Lt => FilterOp::Lt,
+                Op::Gte => FilterOp::Gte,
+                Op::Lte => FilterOp::Lte,
+            };
+            assert_eq!(back, v);
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_range_limit_is_a_validation_error() {
+        let s = server();
+        let kind = |r: CallToolResult| {
+            assert_eq!(r.is_error, Some(true));
+            let v: serde_json::Value = serde_json::from_str(&text_of(&r)).unwrap();
+            v["kind"].as_str().unwrap().to_string()
+        };
+        for limit in [0, 1001] {
+            let r = s
+                .note_list(Parameters(ListParams {
+                    limit: Some(limit),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            assert_eq!(kind(r), "Validation", "list {limit}");
+            let r = s
+                .note_search(Parameters(SearchParams {
+                    text: "x".into(),
+                    prefix: None,
+                    limit: Some(limit),
+                    cursor: None,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(kind(r), "Validation", "search {limit}");
+        }
+        for limit in [0, 101] {
+            let r = s
+                .note_dump(Parameters(DumpParams {
+                    limit: Some(limit),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            assert_eq!(kind(r), "Validation", "dump {limit}");
+        }
+        for limit in [0, 51] {
+            let r = s
+                .note_history(Parameters(HistoryParams {
+                    path: "n/a.md".into(),
+                    limit: Some(limit),
+                    include_body: None,
+                }))
+                .await
+                .unwrap();
+            assert_eq!(kind(r), "Validation", "history {limit}");
+        }
+        // the bounds themselves are accepted
+        let r = s
+            .note_list(Parameters(ListParams {
+                limit: Some(1000),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_ne!(r.is_error, Some(true));
+    }
+
     fn text_of(r: &CallToolResult) -> String {
         r.content
             .iter()
@@ -1200,7 +1552,7 @@ mod tests {
     }
 
     /// Header of the generated guide; free of any count on purpose.
-    const TOOLS_GUIDE_HEAD: &str = "# Tools\n\nEvery tool the server offers, generated from the tool router. Run `just gen-docs` after changing a tool.\n\n";
+    const TOOLS_GUIDE_HEAD: &str = "# Tools\n\nEvery tool the server offers, generated from the tool router. Run `just gen-docs` after changing a tool. The last four columns are the tool annotations in `tools/list`: `-` means the hint is not set because it only applies to a tool that is not read-only.\n\n";
 
     /// The first sentence of a tool description, as one table cell. Cuts at
     /// the first ". " outside backticks that is followed by an uppercase
@@ -1255,15 +1607,43 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// A hint as a table cell: `yes`, `no`, or `-` when the tool does not set
+    /// it (it has no meaning for a read-only tool).
+    fn hint(h: Option<bool>) -> &'static str {
+        match h {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "-",
+        }
+    }
+
+    /// The hint cell of a tool: the public router's value, followed by the
+    /// local router's when that differs (`note_get` writes `to_file` there).
+    fn hint_cell(
+        public: Option<&rmcp::model::Tool>,
+        local: &rmcp::model::Tool,
+        pick: fn(&rmcp::model::ToolAnnotations) -> Option<bool>,
+    ) -> String {
+        let of = |t: &rmcp::model::Tool| t.annotations.as_ref().and_then(pick);
+        let l = of(local);
+        match public.map(of) {
+            Some(p) if p != l => format!("{} (local: {})", hint(p), hint(l)),
+            _ => hint(l).to_string(),
+        }
+    }
+
     /// Markdown table of the tool routers: one row per tool, sorted by name.
     /// The "local only" column is the difference between the local router and
     /// the public one: a tool the public router lacks is "the tool", otherwise
-    /// the parameters it lacks.
+    /// the parameters it lacks. The hint columns are the annotations; where
+    /// the local router differs from the public one the cell says so.
     fn render_tool_table() -> String {
         let mut tools = NoteletMcp::router_for(true).list_all();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         let public = NoteletMcp::router_for(false);
-        let mut out = String::from("| tool | does | local only |\n|---|---|---|\n");
+        let mut out = String::from(
+            "| tool | does | local only | read-only | destructive | idempotent | open world |\n|---|---|---|---|---|---|---|\n",
+        );
         for t in tools {
             let desc = t.description.as_deref().unwrap_or("");
             let cell = first_sentence(desc);
@@ -1289,7 +1669,18 @@ mod tests {
                 }
             };
             let sep = if local_only.is_empty() { "" } else { " " };
-            out.push_str(&format!("| `{}` | {} |{sep}{local_only} |\n", t.name, cell));
+            let p = public.get(&t.name);
+            let hints = [
+                hint_cell(p, &t, |a| a.read_only_hint),
+                hint_cell(p, &t, |a| a.destructive_hint),
+                hint_cell(p, &t, |a| a.idempotent_hint),
+                hint_cell(p, &t, |a| a.open_world_hint),
+            ]
+            .join(" | ");
+            out.push_str(&format!(
+                "| `{}` | {} |{sep}{local_only} | {hints} |\n",
+                t.name, cell
+            ));
         }
         out
     }
