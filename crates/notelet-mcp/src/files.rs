@@ -27,8 +27,9 @@
 //! # Writing
 //!
 //! Every write to a user file (`to_file`, a marked file, a restored file)
-//! goes through one helper. It writes `.<name>.notelet-tmp-<pid>-<n>` in the
-//! same directory (`n` from a process-wide counter, so concurrent writes to
+//! goes through one helper. It writes `.notelet-tmp-<pid>-<n>` in the
+//! same directory (a fixed-length name, so it fits the file-name limit
+//! whatever the target is called; `n` from a process-wide counter, so concurrent writes to
 //! one file never share a temporary; created exclusively, so a link planted
 //! at that name is not followed), with mode 0600 on unix so private text is
 //! never readable by others while it is written. It calls fsync on it, then
@@ -36,10 +37,12 @@
 //! purpose: note bodies are private), renames it over the resolved path and
 //! fsyncs the directory (a failure there is logged, not returned). On any
 //! failure, or a panic, the temporary file is removed and the original is
-//! untouched; a process that is killed can leave a `.…notelet-tmp-…` file
+//! untouched; a process that is killed can leave a `.notelet-tmp-…` file
 //! behind. The resolved path is canonical, so a symlink at the final path
 //! has already been followed: the write replaces the link's target, which
 //! must be inside the root, and the link survives.
+//! Files are created 0600; directories created along the way (by
+//! `write_text`, so also by `export`) follow the umask.
 //! `to_file` overwrites an existing file, except one that parses as a
 //! conflict file written by `note_put` (see below): that is an unresolved
 //! conflict, and it must be restored or deleted first. Nothing is ever
@@ -183,12 +186,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("no directory"))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("no file name"))?
-        .to_string_lossy();
+    path.file_name()
+        .ok_or_else(|| std::io::Error::other("no file name"))?;
     let n = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = dir.join(format!(".{name}.notelet-tmp-{}-{n}", std::process::id()));
+    let tmp_path = dir.join(format!(".notelet-tmp-{}-{n}", std::process::id()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -639,10 +640,15 @@ pub fn restore(root: &FileRoot, file: &str, source: &str) -> Result<Restored, Fi
 
 #[cfg(test)]
 /// A scratch directory under the workspace `target/` (ignored by git).
+/// Each call gets its own directory (a process-wide counter is part of the
+/// name): tests in parallel that ask for the same `name` would otherwise
+/// share it, and the `remove_dir_all` below would delete the other's root.
 pub(crate) fn scratch(name: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let d = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/files-tests")
-        .join(format!("{name}-{}", std::process::id()));
+        .join(format!("{name}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -950,6 +956,16 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains("notelet-tmp"))
             .collect()
+    }
+
+    #[test]
+    fn a_name_at_the_length_limit_can_be_written() {
+        let dir = scratch("longname");
+        let root = FileRoot::new(dir.clone());
+        let name = "a".repeat(255);
+        root.write_text(&name, "long").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(&name)).unwrap(), "long");
+        assert!(leftovers(&dir).is_empty());
     }
 
     #[test]
