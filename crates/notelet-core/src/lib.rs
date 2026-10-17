@@ -23,7 +23,8 @@
 //!             size and truncated, and a truncated body must never be written back with `put`
 //! Revision    the body a `put` replaced or a `delete` removed, keyed by (path, version)
 //! Filter      field (path | updated_at | updated_by) × op (eq ne like ilike gt lt gte lte) × value
-//! Page        limit (1..=1000; dump 1..=100) + exclusive keyset cursor (the last path of the previous page)
+//! Page        limit (1..=1000; dump 1..=100; history 1..=50; out of range is refused, not clamped)
+//!             + exclusive keyset cursor (the last path of the previous page)
 //! ```
 //!
 //! A tail read ([`domain::Tail`], [`domain::NoteView`]) returns the end of the
@@ -60,7 +61,7 @@
 //! keeps it as `source()` and never repeats it in `Display`; `chain()`
 //! renders the error and its causes on one line, for a message or a log
 //! field. `Contended` is the append race; `VersionConflict` is the
-//! optimistic lock; `InvalidPath` / `InvalidFilter` / `InvalidTail` are
+//! optimistic lock; `InvalidPath` / `InvalidFilter` / `InvalidTail` / `InvalidLimit` are
 //! validation; `NotFound` is a missing note; `Storage` is everything the
 //! adapter could not do.
 //!

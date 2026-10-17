@@ -42,6 +42,11 @@ pub enum CoreError {
     #[error("invalid tail: {0}")]
     InvalidTail(String),
 
+    /// A page `limit` outside its range (`1..=1000`; `dump` `1..=100`;
+    /// `history` `1..=50`). It is refused, not clamped.
+    #[error("invalid limit: {0}")]
+    InvalidLimit(String),
+
     /// `append` lost the race to create the note twice in a row; retry.
     #[error("append to {path}: note created concurrently twice")]
     Contended { path: String },
