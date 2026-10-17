@@ -52,7 +52,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ynishi/notelet/rel
 
 ## Run
 
-Requirements: a Postgres database. Local development points at a hosted dev database; there is no local Docker setup to maintain.
+Requirements: a Postgres database, or (for `serve` and `stdio` only) another notelet to forward to. Local development points at a hosted dev database; there is no local Docker setup to maintain.
 
 ```sh
 export NOTELET_DATABASE_URL=postgres://...      # or DATABASE_URL
@@ -86,6 +86,18 @@ Moving a running deployment from the single token to one token per client, witho
 4. When every client has moved, remove the single token and restart. A client still holding it now gets `401`.
 
 Migrations are embedded and applied on start.
+
+### Using another notelet as the store
+
+Instead of a database, `serve` and `stdio` can forward every read and write to a hosted notelet over MCP, so a laptop keeps its own endpoint (`serve` also keeps `/ui`) without a database or the database URL:
+
+```sh
+export NOTELET_REMOTE_URL=https://<host>/mcp      # instead of NOTELET_DATABASE_URL
+export NOTELET_REMOTE_TOKEN_FILE=~/.notelet/token # or NOTELET_REMOTE_TOKEN; the file wins
+notelet-mcp stdio
+```
+
+Setting both a remote URL and a database URL stops startup; a global `DATABASE_URL` counts, so set `NOTELET_DATABASE_URL=` to empty to mask it. `migrate`, `import` and `export` need the database and fail if `NOTELET_REMOTE_URL` is set; no migrations run in remote mode. Writes are recorded under the actor of the remote token: the remote cannot be told another name, so give each client machine its own token there (the local `NOTELET_TOKENS` / `NOTELET_TOKEN` only decide who may call this process; `NOTELET_ACTOR` has no effect on the remote). The process holds one MCP session to the remote for all its local sessions (re-opened if the remote expires it), does not start if the remote is unreachable, and gives up on a connect or a call after 30 seconds (not configurable; the cancel rmcp posts after a timed-out call is bounded by 2 seconds, so a stalled call costs about 32 seconds, and N concurrent stalled calls about 30 seconds plus 2 per call, since cancels go out one at a time). A transport error message names the remote URL (for your own log and client); the token never appears. `NOTELET_REMOTE_TOKEN` is the credential this process presents; `NOTELET_TOKEN` is one it accepts. `append` and `delete` take two calls to the remote (a read-back, and a read before the delete), so they are not atomic with other writers beyond what the remote's version check gives.
 
 Logs go to stderr (`stdout` is the protocol in `stdio` mode). `RUST_LOG` selects the level (default `info`). `rmcp` is held at `info` and `sqlx` at `warn` unless `RUST_LOG` names them, because rmcp's `debug` output includes whole requests and results.
 

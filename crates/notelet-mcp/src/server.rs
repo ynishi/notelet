@@ -763,7 +763,6 @@ mod boundary_tests {
             assert!(tokens.insert(digest(token), Actor::new(actor)));
         }
         Config {
-            database_url: String::new(),
             tokens,
             bind: "127.0.0.1:0".parse().unwrap(),
             actor: "fallback".into(),
