@@ -44,13 +44,20 @@
 //! `put` is optimistic: the caller passes the version it last read; the store
 //! replaces the body only if that is still the current version, otherwise it
 //! answers [`CoreError::VersionConflict`] with the current version. There is
-//! no lease and no explicit lock. A `put` of a body identical to the current
-//! one changes nothing (`changed: false`), so retries are idempotent.
-//! `append` needs no version at all: it adds a line to the end and cannot
-//! clobber anyone. `delete` with a version removes the note only if that is
-//! still the current version; without one it removes whatever is there
-//! (whereas a `put` without a version means "create"). It keeps the removed
-//! body as the last revision. Every write answers a
+//! no lease and no explicit lock. A `put` without a version means "create": if
+//! the note exists, or another create wins the race for a new path, it
+//! answers `VersionConflict` with the current version. A `put` of a body
+//! identical to the current one changes nothing (`changed: false`), so
+//! retries are idempotent. `append` needs no version at all: it adds a line
+//! to the end and cannot clobber anyone. `delete` always names the version it
+//! read and removes the note only if that is still the current version
+//! (otherwise `VersionConflict`), so no write removes a change its caller
+//! never saw. It keeps the removed body as the last revision. Every write
+//! stamps `updated_at` with the time of the write itself (not of the
+//! transaction start), so for one note `updated_at` never runs backwards
+//! against `version`. That is per note only: across notes `updated_at` is not
+//! a change feed, since a long transaction on one note can commit after a
+//! reader has seen a later stamp on another. Every write answers a
 //! [`domain::WriteOutcome`] (version, byte size, SHA-256, changed); for
 //! `delete` these describe the note it removed.
 //!
@@ -59,7 +66,7 @@
 //! The one error type is [`CoreError`]. A variant with a cause (`Storage`)
 //! keeps it as `source()` and never repeats it in `Display`; `chain()`
 //! renders the error and its causes on one line, for a message or a log
-//! field. `Contended` is the append race; `VersionConflict` is the
+//! field. `Contended` is a create that lost its race twice; `VersionConflict` is the
 //! optimistic lock; `InvalidPath` / `InvalidFilter` / `InvalidTail` are
 //! validation; `NotFound` is a missing note; `Storage` is everything the
 //! adapter could not do.
