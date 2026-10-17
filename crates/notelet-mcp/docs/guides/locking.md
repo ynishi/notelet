@@ -46,7 +46,8 @@ Resolve it by editing the file, or by `note_restore { file, source }` with `"our
 
 Omit `expected_version` to say "this note must not exist yet". If it does,
 the result is a conflict carrying the current version, which tells you to
-read it instead.
+read it instead. Two creates racing for a new path end the same way: one
+wins, the other gets that conflict.
 
 ## Writing the same body again
 
@@ -56,9 +57,9 @@ is written. Retrying a put that may already have landed is therefore safe.
 
 ## Deleting
 
-`note_delete { path, expected_version? }`: pass the version you read to
-refuse if someone wrote in between; omit it to delete whatever is there
-(unlike `note_put`, where omitting it means "create"). The removed body is
+`note_delete { path, expected_version }`: `expected_version` is required, the
+version you read; the delete is refused with `Conflict` if someone wrote in
+between (a call without it is `Validation`). The removed body is
 kept as the last entry of `note_history`; that entry names the last writer
 of the body, not who deleted it (the deleter is not recorded). A note created again at that path
 continues from the next version, so history never has two entries with the

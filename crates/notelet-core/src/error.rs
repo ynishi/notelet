@@ -22,8 +22,9 @@ pub enum CoreError {
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// `put` was given an `expected_version` that is not the current one
-    /// (or none, while the note already exists). `current` is what the
+    /// `put` or `delete` was given an `expected_version` that is not the
+    /// current one (or `put` none, while the note already exists, also when
+    /// another create won the race). `current` is what the
     /// caller should read before retrying.
     #[error("version conflict on {path}: expected {}, current {current}", .expected.map_or_else(|| "none".to_string(), |v| v.to_string()))]
     VersionConflict {
@@ -42,8 +43,9 @@ pub enum CoreError {
     #[error("invalid tail: {0}")]
     InvalidTail(String),
 
-    /// `append` lost the race to create the note twice in a row; retry.
-    #[error("append to {path}: note created concurrently twice")]
+    /// A create (`append` or a `put` without a version) lost the race to
+    /// another create twice in a row; retry.
+    #[error("create of {path}: note created concurrently twice")]
     Contended { path: String },
 
     /// The storage adapter failed. The cause is the adapter's own error,
@@ -139,7 +141,7 @@ mod tests {
         let e = CoreError::Contended { path: "a/b".into() };
         assert_eq!(
             e.to_string(),
-            "append to a/b: note created concurrently twice"
+            "create of a/b: note created concurrently twice"
         );
     }
 }

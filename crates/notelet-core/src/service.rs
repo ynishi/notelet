@@ -94,11 +94,12 @@ impl NoteService {
         Ok(WriteOutcome::of(&note, true))
     }
 
-    /// Delete a note (its body stays readable through `history`).
+    /// Delete a note at the version the caller read (its body stays readable
+    /// through `history`).
     pub async fn delete(
         &self,
         path: &str,
-        expected_version: Option<i64>,
+        expected_version: i64,
         by: &str,
     ) -> Result<WriteOutcome, CoreError> {
         let path = NotePath::parse(path)?;
@@ -291,9 +292,9 @@ mod tests {
     async fn delete_keeps_body_in_history() {
         let s = svc();
         s.put("n/d.md", "bye", None, "t").await.unwrap();
-        let e = s.delete("n/d.md", Some(9), "t").await.unwrap_err();
+        let e = s.delete("n/d.md", 9, "t").await.unwrap_err();
         assert!(matches!(e, CoreError::VersionConflict { current: 1, .. }));
-        let w = s.delete("n/d.md", Some(1), "t").await.unwrap();
+        let w = s.delete("n/d.md", 1, "t").await.unwrap();
         assert_eq!(w.version, 1);
         assert!(matches!(
             s.get("n/d.md").await.unwrap_err(),
@@ -305,7 +306,7 @@ mod tests {
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].body, "bye");
         assert!(matches!(
-            s.delete("n/d.md", None, "t").await.unwrap_err(),
+            s.delete("n/d.md", 1, "t").await.unwrap_err(),
             CoreError::NotFound(_)
         ));
     }
@@ -315,10 +316,10 @@ mod tests {
         let s = svc();
         s.put("n/r.md", "a", None, "t").await.unwrap();
         s.put("n/r.md", "b", Some(1), "t").await.unwrap();
-        s.delete("n/r.md", None, "t").await.unwrap();
+        s.delete("n/r.md", 2, "t").await.unwrap();
         let w = s.put("n/r.md", "c", None, "t").await.unwrap();
         assert_eq!(w.version, 3);
-        s.delete("n/r.md", Some(3), "t").await.unwrap();
+        s.delete("n/r.md", 3, "t").await.unwrap();
         let w = s.append("n/r.md", "d", "t").await.unwrap();
         assert_eq!(w.version, 4);
         let History::Meta(h) = s.history("n/r.md", None, false).await.unwrap() else {

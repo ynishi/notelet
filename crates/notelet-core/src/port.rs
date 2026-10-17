@@ -73,18 +73,14 @@ pub trait NoteRepo: Send + Sync {
     async fn append(&self, path: &NotePath, text: &str, by: &str) -> Result<Note, CoreError>;
 
     /// Remove the note, keeping its current body as the last revision so
-    /// `history` can still read it. `expected = Some(v)` must match the
-    /// current version (else [`CoreError::VersionConflict`]); `None` deletes
-    /// whatever is there (unlike `put`, where `None` means "create").
+    /// `history` can still read it. `expected` must match the
+    /// current version (else [`CoreError::VersionConflict`]): a delete
+    /// names the version it read, like a replacing `put`, so it can never
+    /// remove a change the caller did not see.
     /// [`CoreError::NotFound`] if there is no note. Returns the note as it
     /// was. `by` is not recorded: the kept revision carries the last
     /// writer's `updated_by`, and nothing names who deleted it.
-    async fn delete(
-        &self,
-        path: &NotePath,
-        expected: Option<i64>,
-        by: &str,
-    ) -> Result<Note, CoreError>;
+    async fn delete(&self, path: &NotePath, expected: i64, by: &str) -> Result<Note, CoreError>;
 
     /// Notes whose path starts with `prefix` (empty = all) and satisfy every
     /// filter, ordered by path, paged.
@@ -141,12 +137,7 @@ impl<T: NoteRepo + ?Sized> NoteRepo for Arc<T> {
     async fn append(&self, path: &NotePath, text: &str, by: &str) -> Result<Note, CoreError> {
         (**self).append(path, text, by).await
     }
-    async fn delete(
-        &self,
-        path: &NotePath,
-        expected: Option<i64>,
-        by: &str,
-    ) -> Result<Note, CoreError> {
+    async fn delete(&self, path: &NotePath, expected: i64, by: &str) -> Result<Note, CoreError> {
         (**self).delete(path, expected, by).await
     }
     async fn list(
