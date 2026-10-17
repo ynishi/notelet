@@ -31,6 +31,14 @@ path you pass.
 5. **Recover.** `note_history { path }` lists the bodies that `note_put` replaced or `note_delete` removed, newest first; `include_body: false` lists only their metadata.
 6. **Leave or back up.** `note_dump { prefix }` returns paths and full bodies, paged (default 20, max 100 per page); written to disk it is a file tree.
 
+## Files instead of context (local mode)
+
+When the operator sets `NOTELET_FILE_ROOT` (an existing directory, outside any repository checkout, since note bodies are private), a body can go through a file instead of through your context. This works over `stdio`, and on a `serve` that is bound to a loopback address and has a token; with no root, or on a hosted server, these parameters and `note_restore` are not listed. File names are relative to the root; absolute names, `..`, a trailing `/` and links that lead out of the root are refused.
+
+- `note_get { path, to_file: "work/doc.md" }` writes the body to the file (overwriting it, unless it holds an unresolved conflict; restore or delete that first) and answers `version`, `size` and `sha256` without `body`. It cannot be combined with `tail_lines` or `max_bytes`: a partial body in a file would later replace the whole note.
+- `note_put { path, from_file: "work/doc.md", expected_version }` reads the new body from the file (give exactly one of `body` and `from_file`). Locking is unchanged; compare the answer's `sha256` with the file's.
+- When the put loses the lock, `on_conflict: "mark"` rewrites the file in git's marker form with line counts: `ours` is your file, `base` the version you read (when `note_history` still has it), `theirs` the current body. `note_restore { file, source: "ours" | "theirs" | "base" }` turns it back into one side, byte for byte, and answers `expected_version` (the theirs version, for the next put) and `section_version`. A file with notelet's own header lines is never put. See `notelet://guides/locking`.
+
 ## Bulk import and export
 
 Moving a whole file tree in or out is not done through MCP tools (it would

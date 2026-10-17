@@ -17,11 +17,70 @@
 //! read it per call (and record it as the `actor` field of their span). A
 //! call with no such actor, i.e. over stdio or on a loopback `serve`
 //! without tokens, writes as the configured fallback (`NOTELET_ACTOR`).
+//!
+//! # Local mode
+//!
+//! Local mode adds a file projection (see [`crate::files`] for the file
+//! root, the writes and the conflict file): `note_get` takes `to_file`,
+//! `note_put` takes `from_file` and `on_conflict`, and the tool
+//! `note_restore` exists. It needs a file root, which is `NOTELET_FILE_ROOT`
+//! and nothing else (no working-directory default), and it needs the caller
+//! to be the operator's own process:
+//!
+//! * `stdio` is local when `NOTELET_FILE_ROOT` is set.
+//! * `serve` is local only when the bind address is loopback, the root is
+//!   set and at least one token is configured ([`local_root`]). A tokenless
+//!   loopback port can be reached by any local process or browser page, so
+//!   it never gets file access. When `serve` is not local it logs one line
+//!   at startup giving the reason.
+//!
+//! The root should be outside any repository checkout, since note bodies are
+//! private. In any other mode the file parameters and `note_restore` are
+//! absent.
+//!
+//! The split is by **router**, not by parameter type. The parameter structs
+//! hold every field, and [`NoteletMcp::router_for`] builds the router a
+//! server instance lists and dispatches from: the local one is the full
+//! `#[tool_router]` router with the local usage notes appended to two
+//! descriptions; the public one drops `note_restore`, removes
+//! [`LOCAL_ONLY_PARAMS`] from every input schema, and makes `body` of
+//! `note_put` a required string (it is optional in the local schema, where
+//! `from_file` can stand in for it). A client of a non-local server therefore
+//! never sees a file parameter, and if it sends one anyway the call fails
+//! with `kind: "Validation"` instead of the field being silently ignored.
+//! `just gen-docs` renders the tool table from both routers; the "local
+//! only" column is their difference.
+//!
+//! # Files and conflicts
+//!
+//! The file logic is in [`crate::files`]; this module routes and maps to
+//! JSON. `note_get` with `to_file` writes the body to the file (overwriting
+//! it, except a file holding an unresolved conflict) and answers the note
+//! without `body`, plus its `sha256` and the `file`; it is refused with
+//! `tail_lines` or `max_bytes`, since a partial body written to a file would
+//! later replace the whole note. `note_put` takes exactly one of `body` and
+//! `from_file`; a file that is not UTF-8 or has a notelet header line is
+//! refused. The locking is unchanged: without `expected_version` a put
+//! only creates. With `on_conflict: "mark"` (only with `from_file`, only in
+//! local mode; the default is `"fail"`) a `Conflict` also rewrites the file
+//! into ours / base / theirs, and `note_restore` turns it back into one of
+//! them. The base revision is found by version in `note_history` (metadata
+//! first, then the bodies up to the match).
+//!
+//! The errors added: `kind: "Validation"` for a refused input (also a name
+//! outside the file root) and `kind: "File"` for a failed read or write, both
+//! with `message`. A `Conflict` on a marking put carries, besides
+//! `current_version` and `expected_version`, `marked` (`true` when the file
+//! was rewritten, `false` when it was not, the message says why, e.g. the
+//! file changed during the put), `file`, and `base_version` when the file
+//! has a base section. `note_restore` answers `{ file, source,
+//! expected_version, section_version }`.
 
 use std::sync::Arc;
 
 use notelet_core::service::{FilterInput, History};
 use notelet_core::{CoreError, NoteService, WriteOutcome};
+use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Extensions, ListResourcesResult, PaginatedRequestParams,
@@ -35,14 +94,37 @@ use serde::Deserialize;
 
 use crate::auth::{Actor, TokenTable};
 use crate::config::Config;
+use crate::files::{self, FileError, FileRoot};
 use crate::resources;
 
+/// The parameters that exist only in local mode. They are removed from the
+/// tool schemas of every other mode.
+pub(crate) const LOCAL_ONLY_PARAMS: &[&str] = &["to_file", "from_file", "on_conflict"];
+
+/// The tool that exists only in local mode.
+pub(crate) const LOCAL_ONLY_TOOL: &str = "note_restore";
+
+/// Text appended to a tool's description in local mode only.
+const LOCAL_NOTES: &[(&str, &str)] = &[
+    (
+        "note_get",
+        "Local mode: to_file (a path relative to the file root, parent directories are created) writes the body to that file (overwriting it, unless it holds an unresolved conflict) and leaves body out of the answer, which still has version, size and sha256 (of the file); use it for a body too large to pass through your context. to_file is refused together with tail_lines or max_bytes, because a partial body in a file would later replace the whole note.",
+    ),
+    (
+        "note_put",
+        "Local mode: give exactly one of body and from_file (a path relative to the file root; UTF-8; refused while it still has notelet's conflict header lines). Locking is the same: without expected_version a put only creates. on_conflict (with from_file only) is \"fail\" (default) or \"mark\": on a Conflict, mark rewrites the file as ours (your file), base (the version you read, when expected_version was given and note_history still has it) and theirs (the current body), in git's marker form with line counts, and the error says marked=true; resolve the file, then note_restore it to a side or edit it by hand, and put again with expected_version=current_version (restoring ours and putting overwrites theirs, as git checkout --ours does). Unlike git, whole bodies are compared (no hunks), nothing is merged for you, and nothing is stored beyond the marker lines in the file.",
+    ),
+];
+
 /// The server: a service handle and the fallback actor written to
-/// `updated_by` when the request carries no authenticated actor.
+/// `updated_by` when the request carries no authenticated actor. `files` is
+/// `Some` in local mode (see the module doc) and holds the file root.
 #[derive(Clone)]
 pub struct NoteletMcp {
     svc: Arc<NoteService>,
     actor: String,
+    files: Option<Arc<FileRoot>>,
+    routes: ToolRouter<Self>,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +142,9 @@ pub struct GetParams {
     /// Return at most this many bytes of the end (at least 1), starting on a line when possible.
     #[schemars(range(min = 1))]
     pub max_bytes: Option<u32>,
+    /// Local mode only. Write the body to this file (relative to the file
+    /// root) instead of returning it.
+    pub to_file: Option<String>,
 }
 
 /// `note_put` input.
@@ -68,9 +153,24 @@ pub struct PutParams {
     /// Note path.
     pub path: String,
     /// The whole new body (Markdown).
-    pub body: String,
+    pub body: Option<String>,
+    /// Local mode only. Read the whole new body from this file (relative to
+    /// the file root) instead of `body`.
+    pub from_file: Option<String>,
     /// The version you last read. Omit to create a note that must not exist yet.
     pub expected_version: Option<i64>,
+    /// Local mode only, with `from_file`: `"fail"` (default) or `"mark"`.
+    pub on_conflict: Option<String>,
+}
+
+/// `note_restore` input (local mode only).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RestoreParams {
+    /// A conflict file written by `note_put` with `on_conflict: "mark"`,
+    /// relative to the file root.
+    pub file: String,
+    /// Which section to restore: `"ours"`, `"theirs"` or `"base"`.
+    pub source: String,
 }
 
 /// `note_delete` input.
@@ -171,6 +271,42 @@ fn write_json(r: Result<WriteOutcome, CoreError>) -> Result<CallToolResult, McpE
     }
 }
 
+/// A failed tool result with a machine-readable body: `kind`, `message` and
+/// whatever `extra` adds.
+fn error_result(
+    kind: &str,
+    message: String,
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> CallToolResult {
+    let mut body = serde_json::json!({ "kind": kind, "message": message });
+    if let Some(obj) = body.as_object_mut() {
+        obj.extend(extra);
+    }
+    CallToolResult::error(vec![ContentBlock::text(body.to_string())])
+}
+
+/// A refused or failed file operation as a failed tool result.
+fn file_error(err: &FileError) -> CallToolResult {
+    tracing::debug!(kind = err.kind(), error = %err, "tool rejected");
+    error_result(err.kind(), err.message().to_string(), Default::default())
+}
+
+/// A request that breaks a rule of the tool itself.
+fn refuse(message: impl Into<String>) -> CallToolResult {
+    file_error(&FileError::Refused(message.into()))
+}
+
+/// The `current_version` / `expected_version` fields of a conflict.
+fn conflict_fields(
+    expected: Option<i64>,
+    current: i64,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("current_version".into(), serde_json::Value::from(current));
+    m.insert("expected_version".into(), serde_json::json!(expected));
+    m
+}
+
 /// A domain error as a failed tool result with a machine-readable body. A
 /// conflict also carries `current_version` and `expected_version` (`null`
 /// when the caller passed none, i.e. tried to create).
@@ -189,18 +325,13 @@ fn core_error(err: CoreError) -> CallToolResult {
     } else {
         tracing::debug!(kind, error = %err, "tool rejected");
     }
-    let mut body = serde_json::json!({ "kind": kind, "message": err.chain().to_string() });
-    if let (
+    let extra = match &err {
         CoreError::VersionConflict {
             expected, current, ..
-        },
-        Some(obj),
-    ) = (&err, body.as_object_mut())
-    {
-        obj.insert("current_version".into(), serde_json::Value::from(*current));
-        obj.insert("expected_version".into(), serde_json::json!(expected));
-    }
-    CallToolResult::error(vec![ContentBlock::text(body.to_string())])
+        } => conflict_fields(*expected, *current),
+        _ => Default::default(),
+    };
+    error_result(kind, err.chain().to_string(), extra)
 }
 
 fn filters(input: Option<Vec<FilterParam>>) -> Vec<FilterInput> {
@@ -215,15 +346,99 @@ fn filters(input: Option<Vec<FilterParam>>) -> Vec<FilterInput> {
         .collect()
 }
 
+/// Apply `f` to the `properties` of a tool's input schema.
+fn edit_properties(
+    tool: &mut rmcp::model::Tool,
+    f: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let schema = Arc::make_mut(&mut tool.input_schema);
+    if let Some(props) = schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        f(props);
+    }
+}
+
+/// The refusal for a local-only parameter (or the tool) outside local mode.
+fn not_local(what: &str) -> CallToolResult {
+    refuse(format!(
+        "{what} is available only in local mode: NOTELET_FILE_ROOT must be set to an existing \
+         directory and, for serve, the bind address must be loopback and a token configured"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // tools
 // ---------------------------------------------------------------------------
 
 #[tool_router]
 impl NoteletMcp {
-    /// Build the server over a service.
+    /// Build the server over a service, not in local mode: no file
+    /// parameters, no `note_restore`.
     pub fn new(svc: Arc<NoteService>, actor: String) -> Self {
-        Self { svc, actor }
+        Self {
+            svc,
+            actor,
+            files: None,
+            routes: Self::router_for(false),
+        }
+    }
+
+    /// Build the server in local mode, with file names relative to `root`.
+    pub fn local(svc: Arc<NoteService>, actor: String, root: FileRoot) -> Self {
+        Self {
+            svc,
+            actor,
+            files: Some(Arc::new(root)),
+            routes: Self::router_for(true),
+        }
+    }
+
+    /// The tool router of one mode (see the module doc).
+    pub(crate) fn router_for(local: bool) -> ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        if local {
+            for (name, note) in LOCAL_NOTES {
+                if let Some(route) = router.map.get_mut(*name) {
+                    let d = route.attr.description.take().unwrap_or_default();
+                    route.attr.description = Some(format!("{d} {note}").into());
+                }
+            }
+            if let Some(route) = router.map.get_mut("note_put") {
+                edit_properties(&mut route.attr, |props| {
+                    if let Some(serde_json::Value::String(d)) =
+                        props.get_mut("body").and_then(|b| b.get_mut("description"))
+                    {
+                        d.push_str(" Give exactly one of body and from_file.");
+                    }
+                });
+            }
+        } else {
+            router.remove_route(LOCAL_ONLY_TOOL);
+            for route in router.map.values_mut() {
+                edit_properties(&mut route.attr, |props| {
+                    for name in LOCAL_ONLY_PARAMS {
+                        props.remove(*name);
+                    }
+                });
+            }
+            if let Some(route) = router.map.get_mut("note_put") {
+                let schema = Arc::make_mut(&mut route.attr.input_schema);
+                if let Some(req) = schema
+                    .get_mut("required")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    req.push("body".into());
+                }
+                edit_properties(&mut route.attr, |props| {
+                    if let Some(body) = props.get_mut("body").and_then(|b| b.as_object_mut()) {
+                        body.insert("type".into(), "string".into());
+                    }
+                });
+            }
+        }
+        router
     }
 
     /// The actor of this call: the one [`crate::auth::require_bearer`] put in
@@ -246,10 +461,42 @@ impl NoteletMcp {
         &self,
         Parameters(p): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.svc.read(&p.path, p.tail_lines, p.max_bytes).await {
-            Ok(n) => ok_json(&n),
-            Err(e) => Ok(core_error(e)),
+        let Some(file) = p.to_file.as_deref() else {
+            return match self.svc.read(&p.path, p.tail_lines, p.max_bytes).await {
+                Ok(n) => ok_json(&n),
+                Err(e) => Ok(core_error(e)),
+            };
+        };
+        let Some(root) = self.files.as_deref() else {
+            return Ok(not_local("to_file"));
+        };
+        if p.tail_lines.is_some() || p.max_bytes.is_some() {
+            return Ok(refuse(
+                "to_file cannot be combined with tail_lines or max_bytes: a partial body \
+                 written to a file would later replace the whole note through note_put",
+            ));
         }
+        if let Err(e) = root.resolve(file) {
+            return Ok(file_error(&e));
+        }
+        let note = match self.svc.get(&p.path).await {
+            Ok(n) => n,
+            Err(e) => return Ok(core_error(e)),
+        };
+        if let Err(e) = root.write_body(file, &note.body) {
+            return Ok(file_error(&e));
+        }
+        let out = serde_json::json!({
+            "path": note.path,
+            "version": note.version,
+            "updated_at": note.updated_at,
+            "updated_by": note.updated_by,
+            "size": note.body.len(),
+            "truncated": false,
+            "sha256": notelet_core::domain::sha256_hex(&note.body),
+            "file": file,
+        });
+        ok_json(&out)
     }
 
     #[tool(
@@ -262,11 +509,87 @@ impl NoteletMcp {
         ext: Extensions,
     ) -> Result<CallToolResult, McpError> {
         let actor = self.actor_of(&ext);
-        write_json(
-            self.svc
-                .put(&p.path, &p.body, p.expected_version, &actor)
-                .await,
-        )
+        let mark = match p.on_conflict.as_deref() {
+            None | Some("fail") => false,
+            Some("mark") => true,
+            Some(other) => {
+                if self.files.is_none() {
+                    return Ok(not_local("on_conflict"));
+                }
+                return Ok(refuse(format!(
+                    "on_conflict must be \"fail\" or \"mark\", not {other:?}"
+                )));
+            }
+        };
+        let root = self.files.as_deref();
+        if root.is_none() {
+            for (given, name) in [
+                (p.from_file.is_some(), "from_file"),
+                (p.on_conflict.is_some(), "on_conflict"),
+            ] {
+                if given {
+                    return Ok(not_local(name));
+                }
+            }
+        }
+        if p.on_conflict.is_some() && p.from_file.is_none() {
+            return Ok(refuse("on_conflict needs from_file"));
+        }
+        let body = match (p.body.as_deref(), p.from_file.as_deref(), root) {
+            (Some(_), Some(_), _) => {
+                return Ok(refuse("give exactly one of body and from_file, not both"));
+            }
+            (None, None, None) => return Ok(refuse("body is required")),
+            (None, None, Some(_)) => {
+                return Ok(refuse(
+                    "give exactly one of body and from_file, got neither",
+                ));
+            }
+            (Some(b), None, _) => b.to_string(),
+            (None, Some(f), Some(root)) => match root.read_body(f) {
+                Ok(text) => text,
+                Err(e) => return Ok(file_error(&e)),
+            },
+            (None, Some(_), None) => unreachable!("refused above"),
+        };
+        match self
+            .svc
+            .put(&p.path, &body, p.expected_version, &actor)
+            .await
+        {
+            Err(CoreError::VersionConflict {
+                expected, current, ..
+            }) if mark => {
+                let file = p.from_file.as_deref().unwrap_or_default();
+                let root = root.expect("mark implies from_file implies local");
+                Ok(self
+                    .mark_conflict(root, file, &p.path, &body, expected, current)
+                    .await)
+            }
+            other => write_json(other),
+        }
+    }
+
+    #[tool(
+        description = "Rewrite a conflict file (written by note_put with on_conflict=\"mark\") to one section's body, exactly as it was before marking; local mode only. Pass source as \"ours\" (your file), \"theirs\" (the note's body at the time of the conflict) or \"base\" (the version you had read). Answers file, source, expected_version (the theirs version: pass it to the next note_put) and section_version (the version the restored body belongs to: theirs or base; null for ours). Restoring ours and putting overwrites theirs, as git checkout --ours does; restoring theirs and editing keeps their work. A file that is not a well-formed conflict file, whose line counts do not match, or that has no such section, is an error and stays unchanged. Unlike git there is no merge and no stored state: the markers in the file are all there is."
+    )]
+    #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_restore", file = %p.file))]
+    async fn note_restore(
+        &self,
+        Parameters(p): Parameters<RestoreParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let Some(root) = self.files.as_deref() else {
+            return Ok(not_local(LOCAL_ONLY_TOOL));
+        };
+        match files::restore(root, &p.file, &p.source) {
+            Ok(r) => ok_json(&serde_json::json!({
+                "file": p.file,
+                "source": p.source,
+                "expected_version": r.expected_version,
+                "section_version": r.section_version,
+            })),
+            Err(e) => Ok(file_error(&e)),
+        }
     }
 
     #[tool(
@@ -363,9 +686,93 @@ impl NoteletMcp {
             Err(e) => Ok(core_error(e)),
         }
     }
+
+    /// A put with `on_conflict: "mark"` lost the lock: read the current
+    /// note (and the base revision, when `expected` names one that history
+    /// still has), rewrite `file` as the conflict file, and answer the
+    /// `Conflict` with `marked`, `file` and `base_version`. When marking is
+    /// not possible the answer is the plain conflict with `marked: false`
+    /// and the reason in the message.
+    async fn mark_conflict(
+        &self,
+        root: &FileRoot,
+        file: &str,
+        path: &str,
+        ours: &str,
+        expected: Option<i64>,
+        current: i64,
+    ) -> CallToolResult {
+        let conflict = CoreError::VersionConflict {
+            path: path.to_string(),
+            expected,
+            current,
+        };
+        let unmarked = |current: i64, why: &str| {
+            let mut extra = conflict_fields(expected, current);
+            extra.insert("marked".into(), false.into());
+            extra.insert("file".into(), file.into());
+            tracing::debug!(why, "conflict not marked");
+            error_result(
+                "Conflict",
+                format!("{}; not marked: {why}", conflict.chain()),
+                extra,
+            )
+        };
+        let theirs = match self.svc.get(path).await {
+            Ok(n) => n,
+            Err(e) => return unmarked(current, &format!("the note could not be read back ({e})")),
+        };
+        let base = match expected {
+            Some(v) => self.base_of(path, v).await,
+            None => None,
+        };
+        let theirs_version = theirs.version;
+        match files::mark(root, file, ours, base, (theirs_version, theirs.body)) {
+            Err(why) => unmarked(theirs_version, &why),
+            Ok(base_version) => {
+                let mut extra = conflict_fields(expected, theirs_version);
+                extra.insert("marked".into(), true.into());
+                extra.insert("file".into(), file.into());
+                if let Some(v) = base_version {
+                    extra.insert("base_version".into(), v.into());
+                }
+                error_result(
+                    "Conflict",
+                    format!(
+                        "{}; {file:?} now holds ours, {}theirs (v{theirs_version}): resolve it (edit it, or note_restore it to a side; restoring ours overwrites theirs) and put again with expected_version={theirs_version}",
+                        conflict.chain(),
+                        if base_version.is_some() { "base, " } else { "" },
+                    ),
+                    extra,
+                )
+            }
+        }
+    }
+
+    /// The body of revision `version` of `path`, when history still has it.
+    /// The metadata list finds the version (and only the version: a note
+    /// deleted and created again continues its numbering, so a version names
+    /// one body); then the bodies are read up to that revision.
+    async fn base_of(&self, path: &str, version: i64) -> Option<(i64, String)> {
+        let History::Meta(metas) = self.svc.history(path, Some(50), false).await.ok()? else {
+            return None;
+        };
+        let at = metas.iter().position(|r| r.version == version)?;
+        let History::Full(revs) = self
+            .svc
+            .history(path, Some(u32::try_from(at + 1).ok()?), true)
+            .await
+            .ok()?
+        else {
+            return None;
+        };
+        revs.into_iter()
+            .find(|r| r.version == version)
+            .map(|r| (version, r.body))
+    }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.routes)]
 impl ServerHandler for NoteletMcp {
     fn get_info(&self) -> ServerConfig {
         let mut info = ServerConfig::new(
@@ -410,20 +817,51 @@ impl ServerHandler for NoteletMcp {
 // transports
 // ---------------------------------------------------------------------------
 
-/// Serve over stdio for one local client.
-pub async fn run_stdio(svc: Arc<NoteService>, actor: String) -> anyhow::Result<()> {
+/// Serve over stdio for one local client. Local mode (files under `root`)
+/// is on when a root is given.
+pub async fn run_stdio(
+    svc: Arc<NoteService>,
+    actor: String,
+    root: Option<FileRoot>,
+) -> anyhow::Result<()> {
     use rmcp::{transport::stdio, ServiceExt};
-    let server = NoteletMcp::new(svc, actor);
+    let server = match root {
+        Some(root) => NoteletMcp::local(svc, actor, root),
+        None => {
+            tracing::info!("file projection off: NOTELET_FILE_ROOT is not set");
+            NoteletMcp::new(svc, actor)
+        }
+    };
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
 
+/// The file root of a `serve` in local mode, or why there is none: local
+/// mode needs a loopback bind, `NOTELET_FILE_ROOT`, and at least one token.
+pub(crate) fn local_root(cfg: &Config) -> Result<FileRoot, &'static str> {
+    if !cfg.bind.ip().is_loopback() {
+        return Err("the bind address is not loopback");
+    }
+    let Some(root) = &cfg.file_root else {
+        return Err("NOTELET_FILE_ROOT is not set");
+    };
+    if cfg.tokens.is_empty() {
+        return Err("no token is configured");
+    }
+    Ok(FileRoot::new(root.clone()))
+}
+
 /// Serve over streamable HTTP at `/mcp`, with `/healthz` open, a listed
 /// bearer token required on `/mcp` when any token is configured. The
 /// read-only browser view ([`crate::ui`]) is merged in under `/ui`, behind
-/// HTTP Basic with the same tokens.
+/// HTTP Basic with the same tokens. Local mode is decided by [`local_root`];
+/// when it is off the reason is logged once.
 pub async fn run_http(svc: Arc<NoteService>, cfg: Config) -> anyhow::Result<()> {
+    match local_root(&cfg) {
+        Ok(_) => tracing::info!("file projection on"),
+        Err(why) => tracing::info!("file projection off: {why}"),
+    }
     let router = build_router(svc, &cfg);
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(
@@ -442,6 +880,7 @@ pub async fn run_http(svc: Arc<NoteService>, cfg: Config) -> anyhow::Result<()> 
 /// out so tests can drive it without binding a socket.
 pub(crate) fn build_router(svc: Arc<NoteService>, cfg: &Config) -> axum::Router {
     let actor = cfg.actor.clone();
+    let root = local_root(cfg).ok();
     let ui = crate::ui::router(svc.clone(), cfg.tokens.clone());
     let mut http_config = StreamableHttpServerConfig::default();
     http_config.json_response = true;
@@ -450,7 +889,12 @@ pub(crate) fn build_router(svc: Arc<NoteService>, cfg: &Config) -> axum::Router 
         http_config.allowed_hosts.clear();
     }
     let mcp = StreamableHttpService::new(
-        move || Ok(NoteletMcp::new(svc.clone(), actor.clone())),
+        move || {
+            Ok(match &root {
+                Some(root) => NoteletMcp::local(svc.clone(), actor.clone(), root.clone()),
+                None => NoteletMcp::new(svc.clone(), actor.clone()),
+            })
+        },
         Arc::new(LocalSessionManager::default()),
         http_config,
     );
@@ -506,8 +950,10 @@ mod tests {
             .note_put(
                 Parameters(PutParams {
                     path: "projects/x/a.md".into(),
-                    body: "one".into(),
+                    body: Some("one".into()),
+                    from_file: None,
                     expected_version: None,
+                    on_conflict: None,
                 }),
                 Extensions::default(),
             )
@@ -519,8 +965,10 @@ mod tests {
             .note_put(
                 Parameters(PutParams {
                     path: "projects/x/a.md".into(),
-                    body: "two".into(),
+                    body: Some("two".into()),
+                    from_file: None,
                     expected_version: Some(9),
+                    on_conflict: None,
                 }),
                 Extensions::default(),
             )
@@ -547,8 +995,10 @@ mod tests {
         s.note_put(
             Parameters(PutParams {
                 path: path.into(),
-                body: body.into(),
+                body: Some(body.into()),
+                from_file: None,
                 expected_version,
+                on_conflict: None,
             }),
             Extensions::default(),
         )
@@ -607,6 +1057,7 @@ mod tests {
                 path: "n/d.md".into(),
                 tail_lines: None,
                 max_bytes: None,
+                to_file: None,
             }))
             .await
             .unwrap();
@@ -632,6 +1083,7 @@ mod tests {
             path: path.into(),
             tail_lines,
             max_bytes,
+            to_file: None,
         })
     }
 
@@ -677,6 +1129,7 @@ mod tests {
                 path: "../etc".into(),
                 tail_lines: None,
                 max_bytes: None,
+                to_file: None,
             }))
             .await
             .unwrap();
@@ -766,11 +1219,23 @@ mod tests {
         assert_eq!(first_sentence("a | b. C"), "a \\| b.");
     }
 
-    /// Markdown table of the tool router: one row per tool, sorted by name.
-    /// The "local only" column is empty until a tool has such parameters.
+    /// The names of the input properties of a tool.
+    fn property_names(t: &rmcp::model::Tool) -> Vec<String> {
+        t.input_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Markdown table of the tool routers: one row per tool, sorted by name.
+    /// The "local only" column is the difference between the local router and
+    /// the public one: a tool the public router lacks is "the tool", otherwise
+    /// the parameters it lacks.
     fn render_tool_table() -> String {
-        let mut tools = NoteletMcp::tool_router().list_all();
+        let mut tools = NoteletMcp::router_for(true).list_all();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let public = NoteletMcp::router_for(false);
         let mut out = String::from("| tool | does | local only |\n|---|---|---|\n");
         for t in tools {
             let desc = t.description.as_deref().unwrap_or("");
@@ -781,7 +1246,23 @@ mod tests {
                 "unbalanced backticks in the first sentence of {}",
                 t.name
             );
-            out.push_str(&format!("| `{}` | {} | |\n", t.name, cell));
+            let local_only = match public.get(&t.name) {
+                None => "the tool".to_string(),
+                Some(p) => {
+                    let public_props = property_names(p);
+                    let mut only: Vec<String> = property_names(&t)
+                        .into_iter()
+                        .filter(|n| !public_props.contains(n))
+                        .collect();
+                    only.sort();
+                    only.iter()
+                        .map(|n| format!("`{n}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            };
+            let sep = if local_only.is_empty() { "" } else { " " };
+            out.push_str(&format!("| `{}` | {} |{sep}{local_only} |\n", t.name, cell));
         }
         out
     }
@@ -889,6 +1370,7 @@ mod boundary_tests {
             tokens,
             bind: "127.0.0.1:0".parse().unwrap(),
             actor: "fallback".into(),
+            file_root: None,
         }
     }
 
@@ -1229,8 +1711,10 @@ mod boundary_tests {
         s.note_put(
             Parameters(PutParams {
                 path: "n/s.md".into(),
-                body: "x".into(),
+                body: Some("x".into()),
+                from_file: None,
                 expected_version: None,
+                on_conflict: None,
             }),
             Extensions::default(),
         )
@@ -1253,3 +1737,6 @@ mod boundary_tests {
         assert_eq!(updated_by(&svc, "n/s.md").await, "fallback");
     }
 }
+
+#[cfg(test)]
+mod file_tests;

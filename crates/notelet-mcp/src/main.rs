@@ -17,7 +17,8 @@
 //! environment variables and a second mechanism would have to be kept in
 //! agreement with it.
 //!
-//! The server itself lives in [`server`]; the bundled guides in
+//! The server itself lives in [`server`] (its local mode, which needs `NOTELET_FILE_ROOT`,
+//! adds the file projection of [`files`]); the bundled guides in
 //! [`resources`]; token lookup and the per-token actor in [`auth`]; the
 //! operator's bulk
 //! `import` / `export` (not MCP tools) in [`transfer`]; the read-only
@@ -26,6 +27,7 @@
 
 mod auth;
 mod config;
+mod files;
 mod remote;
 mod render;
 mod resources;
@@ -159,10 +161,12 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.cmd.unwrap_or(Cmd::Serve) {
         Cmd::Stdio => {
+            cfg.check_file_root()?;
             let svc = Arc::new(NoteService::new(open_serving_repo(&backend).await?));
-            server::run_stdio(svc, cfg.actor).await
+            server::run_stdio(svc, cfg.actor, cfg.file_root.map(files::FileRoot::new)).await
         }
         Cmd::Serve => {
+            cfg.check_file_root()?;
             let svc = Arc::new(NoteService::new(open_serving_repo(&backend).await?));
             server::run_http(svc, cfg).await
         }

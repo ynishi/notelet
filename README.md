@@ -25,10 +25,11 @@ The list is generated from the tool router (also served as `notelet://guides/too
 | `note_append` | Append text to the end of a note (created if missing), on its own line. | |
 | `note_delete` | Remove a note. | |
 | `note_dump` | Paths and full bodies under a prefix, ordered by path and paged: default 20, max 100 (bodies are heavy); pass next_cursor as cursor (exclusive). | |
-| `note_get` | Read one note: path, body (Markdown), version, updated_at, updated_by, size, truncated. | |
+| `note_get` | Read one note: path, body (Markdown), version, updated_at, updated_by, size, truncated. | `to_file` |
 | `note_history` | Bodies that note_put replaced or note_delete removed for this path, newest first (default 20, max 50). | |
 | `note_list` | List notes (path, version, updated_at, updated_by, size in bytes (UTF-8); no body) under a prefix, filtered by ANDed predicates {field, op, value}. | |
-| `note_put` | Create or replace a note's whole body with optimistic locking. | |
+| `note_put` | Create or replace a note's whole body with optimistic locking. | `from_file`, `on_conflict` |
+| `note_restore` | Rewrite a conflict file (written by note_put with on_conflict="mark") to one section's body, exactly as it was before marking; local mode only. | the tool |
 | `note_search` | Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. | |
 <!-- tools:end -->
 
@@ -63,6 +64,7 @@ export NOTELET_DATABASE_URL=postgres://...      # or DATABASE_URL
 export NOTELET_TOKEN=...                        # one shared token; or NOTELET_TOKEN_FILE=~/.notelet/token
 export NOTELET_TOKENS_FILE=~/.notelet/tokens    # one token per client (below); or NOTELET_TOKENS="alice:<sha256> bob:<sha256>"
 export NOTELET_BIND=127.0.0.1:8490              # default; non-loopback requires a token
+export NOTELET_FILE_ROOT=/path/to/work          # an existing directory outside any repository checkout: switches on local mode (to_file / from_file / note_restore) for stdio, and for a loopback serve with a token; unset = no file access
 export RUST_LOG=info                            # log level; default info
 notelet-mcp serve                               # streamable HTTP at /mcp, /healthz open
 notelet-mcp stdio                               # one local client over stdin/stdout

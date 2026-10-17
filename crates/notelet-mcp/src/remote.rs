@@ -573,6 +573,7 @@ mod tests {
             tokens,
             bind: "127.0.0.1:0".parse().unwrap(),
             actor: "fallback".into(),
+            file_root: None,
         };
         let router = crate::server::build_router(svc, &cfg);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -810,6 +811,7 @@ mod tests {
             tokens,
             bind: "127.0.0.1:0".parse().unwrap(),
             actor: "fallback".into(),
+            file_root: None,
         };
         let router = crate::server::build_router(svc, &cfg);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -885,6 +887,7 @@ mod tests {
             tokens: TokenTable::default(),
             bind: "127.0.0.1:0".parse().unwrap(),
             actor: "fallback".into(),
+            file_root: None,
         };
         let st = stall.clone();
         let router = crate::server::build_router(svc, &cfg).layer(axum::middleware::from_fn(

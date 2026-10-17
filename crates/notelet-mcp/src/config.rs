@@ -13,6 +13,7 @@
 //! | `NOTELET_TOKEN_FILE` | read that token from this file instead (trailing newline stripped) | none |
 //! | `NOTELET_BIND` | `host:port` for `serve` | `127.0.0.1:8490` |
 //! | `NOTELET_ACTOR` | (same name rule as actors, checked at startup) `updated_by` for `NOTELET_TOKEN`, and for writes with no credential (`stdio`, `import`, a loopback `serve` without tokens) | `mcp` |
+//! | `NOTELET_FILE_ROOT` | an existing directory (checked by `serve` and `stdio` only) that `to_file` / `from_file` / `note_restore` names are relative to; setting it switches on local mode for `stdio`, and for a loopback `serve` that has a token (see [`crate::files`] and [`crate::server`]). It should be outside any repository checkout, since note bodies are private | none: no file access |
 //! | `RUST_LOG` | log filter, read in `main` (`rmcp` is held at `info`, `sqlx` at `warn`, unless named) | `info` |
 //!
 //! The token table is the union of `NOTELET_TOKENS[_FILE]` and the single
@@ -40,6 +41,7 @@
 //! instance must never be reachable without `Authorization: Bearer`.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::Context;
 
@@ -140,9 +142,25 @@ pub struct Config {
     /// The actor for writes that carry no credential: `stdio`, `import`, a
     /// tokenless loopback `serve`; also the actor of `NOTELET_TOKEN`.
     pub actor: String,
+    /// `NOTELET_FILE_ROOT`: the directory of local mode's file names, if set.
+    pub file_root: Option<PathBuf>,
 }
 
 impl Config {
+    /// Fail unless `NOTELET_FILE_ROOT`, when set, names an existing
+    /// directory (a typo must not quietly turn the feature off or point it
+    /// somewhere else). Called for `serve` and `stdio` only; the value is
+    /// not echoed.
+    pub fn check_file_root(&self) -> anyhow::Result<()> {
+        if let Some(root) = &self.file_root {
+            anyhow::ensure!(
+                root.is_dir(),
+                "NOTELET_FILE_ROOT must be an existing directory"
+            );
+        }
+        Ok(())
+    }
+
     /// Default bind address: loopback, so a bare `serve` is never exposed.
     pub const DEFAULT_BIND: &'static str = "127.0.0.1:8490";
 
@@ -188,6 +206,8 @@ impl Config {
             add_single_token(&mut tokens, &token, &actor)?;
         }
 
+        let file_root = resolve_file_root(std::env::var("NOTELET_FILE_ROOT").ok());
+
         let bind_raw = std::env::var("NOTELET_BIND").unwrap_or_else(|_| Self::DEFAULT_BIND.into());
         let bind: SocketAddr = bind_raw
             .parse()
@@ -206,10 +226,19 @@ impl Config {
                 tokens,
                 bind,
                 actor,
+                file_root,
             },
             backend,
         ))
     }
+}
+
+/// `NOTELET_FILE_ROOT`: unset or empty is no file access. Whether the
+/// directory exists is checked by [`Config::check_file_root`], which only
+/// `serve` and `stdio` call, so a stale value does not stop `migrate`,
+/// `import` or `export`.
+fn resolve_file_root(raw: Option<String>) -> Option<PathBuf> {
+    raw.filter(|r| !r.is_empty()).map(PathBuf::from)
 }
 
 /// `NOTELET_ACTOR`: unset or empty is `mcp`; anything else must be a valid
@@ -346,6 +375,30 @@ mod tests {
             assert!(err.contains("NOTELET_ACTOR"), "{err}");
             assert!(!err.contains(bad));
         }
+    }
+
+    #[test]
+    fn file_root_is_explicit_and_checked_only_when_serving() {
+        assert_eq!(resolve_file_root(None), None);
+        assert_eq!(resolve_file_root(Some(String::new())), None);
+        // reading a stale value does not fail: migrate / import / export never check it
+        let stale = resolve_file_root(Some("/no/such/directory/for/notelet".into()));
+        assert_eq!(stale, Some(PathBuf::from("/no/such/directory/for/notelet")));
+        let cfg = |root: Option<PathBuf>| Config {
+            tokens: TokenTable::default(),
+            bind: Config::DEFAULT_BIND.parse().unwrap(),
+            actor: "mcp".into(),
+            file_root: root,
+        };
+        assert!(cfg(None).check_file_root().is_ok());
+        assert!(cfg(Some(env!("CARGO_MANIFEST_DIR").into()))
+            .check_file_root()
+            .is_ok());
+        let err = cfg(stale).check_file_root().unwrap_err().to_string();
+        assert!(err.contains("NOTELET_FILE_ROOT"), "{err}");
+        assert!(!err.contains("/no/such"), "the value is not echoed: {err}");
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert!(cfg(Some(file.into())).check_file_root().is_err());
     }
 
     fn some(s: &str) -> Option<String> {
