@@ -977,9 +977,15 @@ mod boundary_tests {
         assert_eq!(revs[0].updated_by, "alice");
     }
 
-    /// Records the `actor` field of every span it sees.
-    #[derive(Clone, Default)]
-    struct ActorSpy(Arc<std::sync::Mutex<Vec<String>>>);
+    thread_local! {
+        /// Actors recorded on spans by the current thread. Per thread, so
+        /// concurrently running tests never see each other's spans.
+        static ACTORS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Records the `actor` field of every span the current thread records.
+    struct ActorSpy;
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ActorSpy {
         fn on_record(
@@ -988,25 +994,53 @@ mod boundary_tests {
             values: &tracing::span::Record<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            struct V<'a>(&'a ActorSpy);
-            impl tracing::field::Visit for V<'_> {
+            struct V;
+            impl tracing::field::Visit for V {
                 fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
                     if f.name() == "actor" {
-                        self.0 .0.lock().unwrap().push(v.to_string());
+                        ACTORS.with(|a| a.borrow_mut().push(v.to_string()));
                     }
                 }
                 fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
             }
-            values.record(&mut V(self));
+            values.record(&mut V);
         }
+    }
+
+    /// Installs the spy as the process-wide subscriber, once.
+    ///
+    /// A scoped `set_default` subscriber is not enough here. Tracing caches
+    /// each callsite's interest the first time any thread reaches it. While
+    /// only one dispatcher is registered (tracing-core `Rebuilder::JustOne`),
+    /// that cache is built from the reaching thread's default only. Another
+    /// test that reaches `note_delete` first with no subscriber caches
+    /// "never", so this thread's span is disabled and `actor` is never
+    /// recorded. A global subscriber is every thread's default, so no thread
+    /// can cache "never". A later scoped subscriber elsewhere makes tracing
+    /// combine interests across all dispatchers ("sometimes"), and this
+    /// thread still uses the global one, so adding one does not reopen the
+    /// race.
+    ///
+    /// `ACTORS` is thread-local and recording happens on the calling thread,
+    /// so the call under test must run on the test thread (a current_thread
+    /// `#[tokio::test]`, not inside `tokio::spawn`).
+    ///
+    /// Do not install a `Dispatch::none()` or `from_static` scoped default in
+    /// this binary: it raises the scoped count without registering and would
+    /// bring back the `JustOne` path.
+    fn install_actor_spy() {
+        use tracing_subscriber::layer::SubscriberExt;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(ActorSpy))
+                .expect("no other test installs a global subscriber");
+        });
     }
 
     #[tokio::test]
     async fn delete_actor_is_recorded_on_the_span() {
-        use tracing_subscriber::layer::SubscriberExt;
-        let spy = ActorSpy::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(spy.clone()));
+        install_actor_spy();
+        ACTORS.with(|a| a.borrow_mut().clear());
         let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
         svc.put("n/d.md", "x", None, "alice").await.unwrap();
         let s = NoteletMcp::new(svc, "fallback".into());
@@ -1028,7 +1062,7 @@ mod boundary_tests {
         )
         .await
         .unwrap();
-        assert_eq!(*spy.0.lock().unwrap(), vec!["bob".to_string()]);
+        assert_eq!(ACTORS.with(|a| a.borrow().clone()), vec!["bob".to_string()]);
     }
 
     #[tokio::test]
