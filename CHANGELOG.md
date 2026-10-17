@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/ynishi/notelet/compare/v0.4.0...v0.5.0) - 2026-10-17
+
+### Added
+
+- declare tool annotations and state allowed values in input schemas
+- keep the store's contract under concurrent writes
+
+### Fixed
+
+- keep notes private and intact through import / export
+
 ## [0.4.0](https://github.com/ynishi/notelet/compare/v0.3.0...v0.4.0) - 2026-10-17
 
 ### Added
