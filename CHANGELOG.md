@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/ynishi/notelet/compare/v0.3.0...v0.4.0) - 2026-10-17
+
+### Added
+
+- project a note onto a local file in note_get / note_put, with git-style conflict files and note_restore
+- add a remote backend for serve and stdio
+
+### Fixed
+
+- make the actor span test independent of other tests' tracing state
+
+### Other
+
+- Generate the tool list in the docs from the tool router
+
 ## [0.3.0](https://github.com/ynishi/notelet/compare/v0.2.0...v0.3.0) - 2026-10-15
 
 ### Added
