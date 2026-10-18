@@ -91,9 +91,10 @@ pub trait NoteRepo: Send + Sync {
         page: &Page,
     ) -> Result<PageOut<NoteMeta>, CoreError>;
 
-    /// Notes whose body contains `text` (case-insensitive substring), under
-    /// `prefix`, ordered by path, paged. The snippet is a window around the
-    /// first occurrence.
+    /// Notes whose path or body contains `text` (case-insensitive substring),
+    /// under `prefix`, ordered by path, paged. The snippet is a window around
+    /// the first occurrence in the body, or the start of the body when only
+    /// the path matches.
     async fn search(
         &self,
         text: &str,

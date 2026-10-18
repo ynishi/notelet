@@ -67,6 +67,10 @@ async fn round_trip_against_postgres() {
         .unwrap();
     assert_eq!(s.items.len(), 1);
     assert!(s.items[0].snippet.contains("second"));
+    // a path hit (different case) with no body match: snippet is the body start
+    let s = svc.search("J.MD", Some(&prefix), None, None).await.unwrap();
+    assert_eq!(s.items.len(), 1);
+    assert!(s.items[0].snippet.starts_with("first"));
     let d = svc.dump(Some(&prefix), None, None).await.unwrap();
     assert_eq!(d.items.len(), 2);
 

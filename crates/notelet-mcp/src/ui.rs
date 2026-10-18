@@ -9,7 +9,7 @@
 //! | `/ui/` | the top-level prefixes (`projects/`, `tasks/`, `lists/` and any other that exists), top-level notes, a search form |
 //! | `/ui/tree/{prefix}` | one page (100) of `list(prefix)`: path, size in bytes, updated_at; the prefixes directly below; `?cursor=` for the next page |
 //! | `/ui/note/{path}` | the note's body rendered from Markdown (see [`crate::render`]), with version, updated_at and size; the whole-note reference `notelet:<path>@v<version>`, and per heading an `id`, a `¶` link and the section reference (below) |
-//! | `/ui/search?q=&prefix=` | `search(q, prefix)` hits with snippets; an empty `q` shows only the form |
+//! | `/ui/search?q=&prefix=` | `search(q, prefix)` hits (path or body) with snippets; an empty `q` shows only the form |
 //!
 //! Access: when tokens are configured, every `/ui` request needs HTTP Basic
 //! with any listed token as the password (any user name; the same table as
@@ -390,7 +390,7 @@ fn crumbs(path: &str) -> String {
 
 fn search_form(q: &str, prefix: &str) -> String {
     format!(
-        r#"<form action="/ui/search" method="get"><input type="search" name="q" value="{}" placeholder="search note bodies"> <input type="text" name="prefix" value="{}" placeholder="prefix"> <button type="submit">search</button></form>"#,
+        r#"<form action="/ui/search" method="get"><input type="search" name="q" value="{}" placeholder="search paths and bodies"> <input type="text" name="prefix" value="{}" placeholder="prefix"> <button type="submit">search</button></form>"#,
         escape(q),
         escape(prefix),
     )

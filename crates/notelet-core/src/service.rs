@@ -125,7 +125,7 @@ impl NoteService {
         self.repo.list(prefix, &filters, &page).await
     }
 
-    /// Case-insensitive substring search over bodies under a prefix.
+    /// Case-insensitive substring search over paths and bodies under a prefix.
     pub async fn search(
         &self,
         text: &str,
@@ -436,6 +436,42 @@ mod tests {
             .list(None, &[f("body", "eq", "x")], None, None)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn search_matches_path_or_body_once() {
+        let s = svc();
+        s.put("n/Needle-path.md", "plain body", None, "t")
+            .await
+            .unwrap();
+        s.put("n/other.md", "has a NEEDLE inside", None, "t")
+            .await
+            .unwrap();
+        s.put("n/both-needle.md", "needle again", None, "t")
+            .await
+            .unwrap();
+        s.put("n/none.md", "nothing", None, "t").await.unwrap();
+        let r = s.search("needle", None, None, None).await.unwrap();
+        let paths: Vec<&str> = r.items.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["n/Needle-path.md", "n/both-needle.md", "n/other.md"]
+        );
+        assert_eq!(r.items[0].snippet, "plain body");
+        assert!(r.items[1].snippet.contains("needle again"));
+        assert!(r.items[2].snippet.contains("NEEDLE"));
+    }
+
+    #[tokio::test]
+    async fn path_only_hit_snippet_is_the_first_200_chars_of_a_multibyte_body() {
+        let s = svc();
+        let body: String = "\u{e9}\u{3042}x".repeat(100);
+        s.put("n/Needle.md", &body, None, "t").await.unwrap();
+        let r = s.search("needle", None, None, None).await.unwrap();
+        assert_eq!(r.items.len(), 1);
+        let want: String = body.chars().take(200).collect();
+        assert_eq!(r.items[0].snippet, want);
+        assert_eq!(r.items[0].snippet.chars().count(), 200);
     }
 
     #[tokio::test]
