@@ -11,9 +11,9 @@ check:
     cargo fmt --all -- --check
     cargo clippy -p notelet-core -p notelet-mcp -p notelet --all-targets -- -D warnings
 
-# unit tests (no database)
+# unit tests (no database; NOTELET_TEST_DATABASE_URL is ignored, see test-pg)
 test:
-    cargo test -p notelet-core
+    env -u NOTELET_TEST_DATABASE_URL cargo test -p notelet-core
     cargo test -p notelet-mcp
     cargo test -p notelet
 
