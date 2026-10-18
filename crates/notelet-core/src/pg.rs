@@ -442,6 +442,8 @@ impl NoteRepo for PgNoteRepo {
         }))
     }
 
+    /// Case folding (`ILIKE`, `lower()`) follows the database's `LC_CTYPE`;
+    /// under `C` non-ASCII letters do not fold, unlike the in-memory adapter.
     async fn search(
         &self,
         text: &str,
@@ -454,9 +456,11 @@ impl NoteRepo for PgNoteRepo {
                substr(body, greatest(position(lower(",
         );
         qb.push_bind(text.to_string())
-            .push(") in lower(body)) - 60, 1), 200) AS snippet FROM notes WHERE body ILIKE ")
+            .push(") in lower(body)) - 60, 1), 200) AS snippet FROM notes WHERE (path ILIKE ")
+            .push_bind(pattern.clone())
+            .push(" ESCAPE '\\' OR body ILIKE ")
             .push_bind(pattern)
-            .push(" ESCAPE '\\'");
+            .push(" ESCAPE '\\')");
         Self::push_prefix_and_cursor(&mut qb, prefix, page.cursor.as_deref());
         qb.push(" ORDER BY path LIMIT ")
             .push_bind(i64::from(page.limit) + 1);

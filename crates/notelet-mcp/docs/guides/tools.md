@@ -12,4 +12,4 @@ Every tool the server offers, generated from the tool router. Run `just gen-docs
 | `note_list` | List notes (path, version, updated_at, updated_by, size in bytes (UTF-8); no body) under a prefix, filtered by ANDed predicates {field, op, value}. | | yes | - | - | no |
 | `note_put` | Create or replace a note's whole body with optimistic locking. | `from_file`, `on_conflict` | no | yes | yes | no |
 | `note_restore` | Rewrite a conflict file (written by note_put with on_conflict="mark") to one section's body, exactly as it was before marking; local mode only. | the tool | no | yes | yes | no |
-| `note_search` | Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. | | yes | - | - | no |
+| `note_search` | Find notes whose path or body contains the text (case-insensitive substring, no wildcards) under a prefix. | | yes | - | - | no |

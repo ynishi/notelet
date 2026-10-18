@@ -287,12 +287,17 @@ impl NoteRepo for MemoryNoteRepo {
         let g = self.inner.lock().await;
         let rows: Vec<SearchHit> = after_cursor(&g.notes, prefix, page.cursor.as_deref())
             .filter_map(|n| {
-                let at = find_lowercase(&n.body, &needle)?;
-                let start = n.body[..at]
-                    .char_indices()
-                    .rev()
-                    .nth(59)
-                    .map_or(0, |(i, _)| i);
+                let at = find_lowercase(&n.body, &needle);
+                if at.is_none() && find_lowercase(n.path.as_str(), &needle).is_none() {
+                    return None;
+                }
+                let start = at.map_or(0, |at| {
+                    n.body[..at]
+                        .char_indices()
+                        .rev()
+                        .nth(59)
+                        .map_or(0, |(i, _)| i)
+                });
                 let snippet: String = n.body[start..].chars().take(200).collect();
                 Some(SearchHit {
                     path: n.path.clone(),

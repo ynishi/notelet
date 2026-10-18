@@ -342,7 +342,7 @@ pub struct ListParams {
 /// `note_search` input.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
-    /// Case-insensitive substring to find in bodies. `%` and `_` are literal.
+    /// Case-insensitive substring to find in paths and bodies. `%` and `_` are literal.
     pub text: String,
     /// Only paths starting with this.
     pub prefix: Option<String>,
@@ -805,7 +805,7 @@ impl NoteletMcp {
 
     #[tool(
         annotations(read_only_hint = true, open_world_hint = false),
-        description = "Find notes whose body contains the text (case-insensitive substring, no wildcards) under a prefix. Returns path, a snippet around the first hit, updated_at. Ordered by path; paged by next_cursor (exclusive: the page starts strictly after that path). Default limit 100, max 1000; a limit outside the range is refused (kind=Validation)."
+        description = "Find notes whose path or body contains the text (case-insensitive substring, no wildcards) under a prefix. Returns path, a snippet around the first hit in the body (the start of the body when only the path matches), updated_at. Ordered by path; paged by next_cursor (exclusive: the page starts strictly after that path). Default limit 100, max 1000; a limit outside the range is refused (kind=Validation)."
     )]
     #[tracing::instrument(level = "debug", skip_all, fields(tool = "note_search", prefix = ?p.prefix))]
     async fn note_search(
