@@ -168,10 +168,11 @@ Design notes are in the crate docs (`cargo doc --open`), starting at `notelet_co
 ## Develop
 
 ```sh
-just check          # fmt + clippy
-just test           # unit tests (no database needed)
-NOTELET_TEST_DATABASE_URL=postgres://... just test-pg   # Postgres integration test
-just dev            # run `serve` against the dev database in the environment
+just check           # fmt + clippy
+just test            # unit tests (no database needed)
+just test-pg-local   # Postgres integration test on a throwaway Docker Postgres
+just pg-up / pg-down # start / remove that container by hand (test-pg uses it unless NOTELET_TEST_DATABASE_URL is set)
+just dev             # run `serve` against the dev database in the environment
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [PUBLIC_DEVELOPMENT.md](PUBLIC_DEVELOPMENT.md).

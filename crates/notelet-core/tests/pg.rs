@@ -1,6 +1,7 @@
 //! Integration test against a real Postgres. Skipped (passes trivially)
-//! unless `NOTELET_TEST_DATABASE_URL` is set; CI and local runs point it at
-//! a throwaway database. The test uses its own path prefix and cleans up.
+//! unless `NOTELET_TEST_DATABASE_URL` is set. Local runs (`just test-pg`)
+//! default it to the throwaway container from `just pg-up`; CI points it at
+//! its service container. The test uses its own path prefix and cleans up.
 
 use std::sync::Arc;
 
