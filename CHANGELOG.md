@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/ynishi/notelet/compare/v0.5.0...v0.6.0) - 2026-10-18
+
+### Added
+
+- match the search text against the note path as well as the body
+- bundle a Claude Code plugin that links the notes a session wrote to /ui
+- show a copyable path@version#lines reference for each section in /ui
+
+### Other
+
+- run the Postgres integration test on a throwaway Docker container
+
 ## [0.5.0](https://github.com/ynishi/notelet/compare/v0.4.0...v0.5.0) - 2026-10-17
 
 ### Added
