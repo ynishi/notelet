@@ -14,12 +14,12 @@ notelet is small on purpose. The bar for a change is "does the model need this?"
 
 1. Open an issue describing the change in terms of the model (note / revision / filter / page / tool).
 2. Branch from `main`. Make the change. Update the doc comments in the same change; `CHANGELOG.md` is written by the release PR (see Releases).
-3. `just check` and `just test` must pass. If you touched `pg.rs`, run `just test-pg` against a throwaway database.
+3. `just check` and `just test` must pass. If you touched `pg.rs`, run `just test-pg-local` (a throwaway Docker Postgres).
 4. Open a pull request. A maintainer reviews and merges; contributors do not push to `main`.
 
 ## Verification
 
-Claims in a pull request are backed by output. For a change to `pg.rs`, paste the `just test-pg` result. For a change to a tool, paste the tool's JSON response from a real client or from the unit test.
+Claims in a pull request are backed by output. For a change to `pg.rs`, paste the `just test-pg-local` result. For a change to a tool, paste the tool's JSON response from a real client or from the unit test.
 
 ## Releases
 
