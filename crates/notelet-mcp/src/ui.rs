@@ -9,7 +9,7 @@
 //! | `/ui/` | the top-level prefixes (`projects/`, `tasks/`, `lists/` and any other that exists), top-level notes, a search form |
 //! | `/ui/tree/{prefix}` | one page (100) of `list(prefix)`: path, size in bytes, updated_at; the prefixes directly below; `?cursor=` for the next page |
 //! | `/ui/note/{path}` | the note's body rendered from Markdown (see [`crate::render`]), with version, updated_at and size; the whole-note reference `notelet:<path>@v<version>`, and per heading an `id`, a `¶` link and the section reference (below) |
-//! | `/ui/search?q=&prefix=` | `search(q, prefix)` hits (path or body) with snippets; an empty `q` shows only the form |
+//! | `/ui/search?q=&prefix=` | up to three groups, in order. **Prefix match**: note paths whose part after `prefix` starts with `q` (ASCII case-insensitive), each cut to its minimal match (the path up to the end of the segment holding the end of the match, with the trailing `/` when that is not the whole path), so `alc/x.md` and `alc/y.md` give one row `alc/`. **Path match**: paths whose part after `prefix` contains `q` but does not start with it (matching is on the part of the path after `prefix`, which is added back to each row), cut the same way at the first occurrence (`projects/alc/journal.md` gives `projects/alc/`). A cut ending in `/` links to `/ui/tree/`, a whole path to `/ui/note/`; rows are deduplicated and sorted. Both come from a bounded scan of `list(prefix)` that shares [`SCAN_PAGES`] with the prefix scan (the truncation notice is shown when it stops early), and only on the first page: a `cursor` page shows only the third group. **Notes**: `search(q, prefix)` hits (path or body) with snippets and the `next` link. An empty group is not shown; `No match.` appears only when all three are empty. A leading `/` of `prefix` is stripped before any use. An empty `q` with a non-empty `prefix` answers `303 See Other` to `/ui/tree/<prefix>` (an invalid prefix gets the error page); both empty shows only the form |
 //!
 //! Access: when tokens are configured, every `/ui` request needs HTTP Basic
 //! with any listed token as the password (any user name; the same table as
@@ -49,10 +49,11 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::get,
     Router,
 };
+use notelet_core::domain::validate_prefix;
 use notelet_core::{CoreError, NoteService};
 use serde::Deserialize;
 
@@ -285,25 +286,58 @@ struct SearchQuery {
 
 async fn search(State(ui): State<Ui>, Query(sq): Query<SearchQuery>) -> Response {
     let text = sq.q.unwrap_or_default();
-    let prefix = sq.prefix.unwrap_or_default();
-    let mut body = String::from(r#"<p><a href="/ui/">notelet</a></p><h1>Search</h1>"#);
-    body.push_str(&search_form(&text, &prefix));
-    if text.trim().is_empty() {
-        return page("search", &body);
+    let prefix = sq
+        .prefix
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_string();
+    let q = text.trim();
+    if q.is_empty() {
+        if prefix.is_empty() {
+            let mut body = String::from(r#"<p><a href="/ui/">notelet</a></p><h1>Search</h1>"#);
+            body.push_str(&search_form(&text, &prefix));
+            return page("search", &body);
+        }
+        if let Err(e) = validate_prefix(&prefix) {
+            return error_page(e);
+        }
+        return Redirect::to(&format!("/ui/tree/{prefix}")).into_response();
     }
     let cursor = sq.cursor.filter(|c| !c.is_empty());
-    let hits = match ui
-        .svc
-        .search(&text, Some(&prefix), Some(PAGE), cursor)
-        .await
-    {
+    let mut body = String::from(r#"<p><a href="/ui/">notelet</a></p><h1>Search</h1>"#);
+    body.push_str(&search_form(q, &prefix));
+    let mut shown = false;
+    if cursor.is_none() {
+        let (starts, contains, truncated) = match path_matches(&ui.svc, &prefix, q).await {
+            Ok(m) => m,
+            Err(e) => return error_page(e),
+        };
+        for (title, rows) in [("Prefix match", &starts), ("Path match", &contains)] {
+            if rows.is_empty() {
+                continue;
+            }
+            shown = true;
+            body.push_str(&format!("<h2>{title}</h2><ul>"));
+            for cut in rows {
+                let kind = if cut.ends_with('/') { "tree" } else { "note" };
+                body.push_str(&format!(
+                    r#"<li><a href="/ui/{kind}/{0}">{0}</a></li>"#,
+                    escape(cut)
+                ));
+            }
+            body.push_str("</ul>");
+        }
+        if truncated {
+            body.push_str(TRUNCATED);
+        }
+    }
+    let hits = match ui.svc.search(q, Some(&prefix), Some(PAGE), cursor).await {
         Ok(h) => h,
         Err(e) => return error_page(e),
     };
-    if hits.items.is_empty() {
-        body.push_str("<p>No match.</p>");
-    } else {
-        body.push_str(r#"<ul class="hits">"#);
+    if !hits.items.is_empty() {
+        shown = true;
+        body.push_str(r#"<h2>Notes</h2><ul class="hits">"#);
         for h in &hits.items {
             body.push_str(&format!(
                 r#"<li><a href="/ui/note/{0}">{0}</a> <span class="meta">{1}</span><pre>{2}</pre></li>"#,
@@ -314,10 +348,13 @@ async fn search(State(ui): State<Ui>, Query(sq): Query<SearchQuery>) -> Response
         }
         body.push_str("</ul>");
     }
+    if !shown {
+        body.push_str("<p>No match.</p>");
+    }
     if let Some(next) = &hits.next_cursor {
         body.push_str(&format!(
             r#"<p><a href="/ui/search?q={}&amp;prefix={}&amp;cursor={}">next</a></p>"#,
-            escape(&query_value(&text)),
+            escape(&query_value(q)),
             escape(&query_value(&prefix)),
             escape(&query_value(next)),
         ));
@@ -366,6 +403,60 @@ async fn children(svc: &NoteService, prefix: &str) -> Result<Children, CoreError
     }
     out.truncated = true;
     Ok(out)
+}
+
+/// The minimal match of `q` in `path`: `path` cut at the end of the segment
+/// that holds the end of the first (ASCII case-insensitive) occurrence of
+/// `q`, keeping the trailing `/` when the cut is not the whole path. `None`
+/// when `q` does not occur. Paths are ASCII, so byte offsets agree between
+/// the path and its lowercase form.
+fn minimal_match(path: &str, q: &str) -> Option<(String, bool)> {
+    let lower = path.to_ascii_lowercase();
+    let at = lower.find(&q.to_ascii_lowercase())?;
+    let last = at + q.len() - 1;
+    let end = match path[last..].find('/') {
+        Some(i) => last + i + 1,
+        None => path.len(),
+    };
+    Some((path[..end].to_string(), at == 0))
+}
+
+/// Scan up to [`SCAN_PAGES`] pages of `list(prefix)` and return the minimal
+/// matches of `q` that start the part of a path after `prefix`, those that only occur inside one, and
+/// whether the scan stopped early.
+async fn path_matches(
+    svc: &NoteService,
+    prefix: &str,
+    q: &str,
+) -> Result<(BTreeSet<String>, BTreeSet<String>, bool), CoreError> {
+    let mut starts = BTreeSet::new();
+    let mut contains = BTreeSet::new();
+    let mut cursor = None;
+    for _ in 0..SCAN_PAGES {
+        let page = svc.list(Some(prefix), &[], Some(1000), cursor).await?;
+        for m in &page.items {
+            let rest = m
+                .path
+                .as_str()
+                .strip_prefix(prefix)
+                .unwrap_or(m.path.as_str());
+            let head = &m.path.as_str()[..m.path.as_str().len() - rest.len()];
+            match minimal_match(rest, q) {
+                Some((cut, true)) => {
+                    starts.insert(format!("{head}{cut}"));
+                }
+                Some((cut, false)) => {
+                    contains.insert(format!("{head}{cut}"));
+                }
+                None => {}
+            }
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => return Ok((starts, contains, false)),
+        }
+    }
+    Ok((starts, contains, true))
 }
 
 /// Links to `/ui/` and to every `/`-terminated ancestor of `path`. Each link
@@ -784,6 +875,215 @@ mod tests {
         let expected: Vec<String> = (0..total).map(|i| format!("p/{i:04}.md")).collect();
         all.sort();
         assert_eq!(all, expected);
+    }
+
+    async fn paths_app(paths: &[&str]) -> Router {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        for p in paths {
+            svc.put(p, "body", None, "t").await.unwrap();
+        }
+        router(svc, TokenTable::default())
+    }
+
+    #[tokio::test]
+    async fn search_prefix_group_is_deduplicated() {
+        let app = paths_app(&["alc/x.md", "alc/y.md", "alcove/z.md", "alc.md"]).await;
+        let (s, body, _) = call(app, "/ui/search?q=alc", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains("<h2>Prefix match</h2>"), "{body}");
+        assert_eq!(body.matches(r#"href="/ui/tree/alc/""#).count(), 1, "{body}");
+        assert!(body.contains(r#"href="/ui/tree/alcove/""#), "{body}");
+        assert!(body.contains(r#"<li><a href="/ui/note/alc.md">"#), "{body}");
+        assert!(!body.contains("<h2>Path match</h2>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_path_group_cuts_to_segment_or_note() {
+        let app = paths_app(&["projects/alc/journal.md", "note/some/alc.md"]).await;
+        let (_, body, _) = call(app, "/ui/search?q=alc", None).await;
+        assert!(body.contains("<h2>Path match</h2>"), "{body}");
+        assert!(!body.contains("<h2>Prefix match</h2>"), "{body}");
+        assert!(
+            body.contains(r#"<li><a href="/ui/tree/projects/alc/">projects/alc/</a></li>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<li><a href="/ui/note/note/some/alc.md">note/some/alc.md</a></li>"#),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_path_groups_are_case_insensitive() {
+        let app = paths_app(&["alc/x.md", "projects/alc/j.md"]).await;
+        let (_, body, _) = call(app, "/ui/search?q=Alc", None).await;
+        assert!(body.contains(r#"href="/ui/tree/alc/""#), "{body}");
+        assert!(body.contains(r#"href="/ui/tree/projects/alc/""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_path_groups_absent_on_cursor_page() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        for i in 0..(PAGE as usize + 5) {
+            svc.put(&format!("alc/{i:04}.md"), "x", None, "t")
+                .await
+                .unwrap();
+        }
+        let app = router(svc, TokenTable::default());
+        let (_, body, _) = call(app.clone(), "/ui/search?q=alc", None).await;
+        assert!(body.contains("<h2>Prefix match</h2>"), "{body}");
+        let next = next_href(&body).expect("first page has a next link");
+        assert!(next.contains("cursor="), "{next}");
+        let (_, body, _) = call(app, &next, None).await;
+        assert!(body.contains("<h2>Notes</h2>"), "{body}");
+        assert!(!body.contains("<h2>Prefix match</h2>"), "{body}");
+        assert!(!body.contains("<h2>Path match</h2>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_next_link_carries_the_stripped_prefix() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        for i in 0..(PAGE as usize + 5) {
+            svc.put(&format!("alc/{i:04}.md"), "x", None, "t")
+                .await
+                .unwrap();
+        }
+        let app = router(svc, TokenTable::default());
+        let (_, body, _) = call(app, "/ui/search?q=%20alc%20&prefix=/alc", None).await;
+        let next = next_href(&body).expect("next link");
+        assert!(
+            next.starts_with("/ui/search?q=alc&prefix=alc&cursor="),
+            "{next}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_prefix_match_is_relative_to_the_user_prefix() {
+        let app = paths_app(&["projects/alc/x.md", "projects/b/alc.md"]).await;
+        let (_, body, _) = call(app.clone(), "/ui/search?q=alc&prefix=projects/", None).await;
+        let (pm, rest) = body
+            .split_once("<h2>Path match</h2>")
+            .unwrap_or((&body, ""));
+        assert!(pm.contains("<h2>Prefix match</h2>"), "{body}");
+        assert!(pm.contains(r#"href="/ui/tree/projects/alc/""#), "{body}");
+        assert!(
+            rest.contains(r#"href="/ui/note/projects/b/alc.md""#),
+            "{body}"
+        );
+
+        let (_, body, _) = call(app.clone(), "/ui/search?q=x&prefix=projects/", None).await;
+        assert!(!body.contains("<h2>Prefix match</h2>"), "{body}");
+        assert!(body.contains("<h2>Path match</h2>"), "{body}");
+        assert!(
+            body.contains(r#"<li><a href="/ui/note/projects/alc/x.md">"#),
+            "{body}"
+        );
+
+        // A prefix that ends mid-segment: the remainder is `c/x.md`.
+        let (_, body, _) = call(app, "/ui/search?q=c&prefix=projects/al", None).await;
+        assert!(body.contains("<h2>Prefix match</h2>"), "{body}");
+        assert!(body.contains(r#"href="/ui/tree/projects/alc/""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_path_groups_say_when_the_scan_was_cut_short() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        for i in 0..(SCAN_PAGES * 1000 + 1) {
+            svc.put(&format!("big/{i:05}.md"), "x", None, "t")
+                .await
+                .unwrap();
+        }
+        let app = router(svc, TokenTable::default());
+        let started = std::time::Instant::now();
+        let (_, body, _) = call(app, "/ui/search?q=big", None).await;
+        eprintln!("truncated-scan fixture + request: {:?}", started.elapsed());
+        assert!(body.contains(TRUNCATED), "{body}");
+        assert!(body.contains(r#"href="/ui/tree/big/""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_empty_q_with_prefix_redirects_to_the_tree() {
+        let app = paths_app(&["projects/x.md"]).await;
+        let (s, _, r) = call(app.clone(), "/ui/search?q=%20&prefix=projects/", None).await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(r.headers()[header::LOCATION], "/ui/tree/projects/");
+
+        let (s, _, r) = call(app.clone(), "/ui/search?q=&prefix=/projects/", None).await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(r.headers()[header::LOCATION], "/ui/tree/projects/");
+
+        let (s, body, _) = call(app, "/ui/search?q=&prefix=a%3Cb", None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(body.contains("a&lt;b"), "{body}");
+        assert!(!body.contains("a<b"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_strips_leading_slash_from_prefix() {
+        let app = paths_app(&["projects/alc/j.md", "other/alc/j.md"]).await;
+        let (s, body, _) = call(app, "/ui/search?q=alc&prefix=/projects", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains(r#"href="/ui/tree/projects/alc/""#), "{body}");
+        assert!(!body.contains("other/"), "{body}");
+        assert!(body.contains(r#"name="prefix" value="projects""#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_no_match_only_when_all_groups_empty() {
+        let app = paths_app(&["alc/x.md"]).await;
+        let (_, body, _) = call(app.clone(), "/ui/search?q=zzz", None).await;
+        assert!(body.contains("<p>No match.</p>"), "{body}");
+        assert!(!body.contains("<h2>"), "{body}");
+        let (_, body, _) = call(app, "/ui/search?q=alc", None).await;
+        assert!(!body.contains("No match."), "{body}");
+    }
+
+    #[tokio::test]
+    async fn search_path_rows_are_escaped() {
+        // Paths are restricted to a safe charset, so the rows carry no
+        // markup of their own; what could carry it is the echoed query.
+        let app = paths_app(&["a.b/x.md"]).await;
+        let (_, body, _) = call(app.clone(), "/ui/search?q=a.b", None).await;
+        assert!(
+            body.contains(r#"<li><a href="/ui/tree/a.b/">a.b/</a></li>"#),
+            "{body}"
+        );
+        let (_, body, _) = call(app, "/ui/search?q=%3Cscript%3E", None).await;
+        assert!(body.contains("&lt;script&gt;"), "{body}");
+        assert!(!body.contains("<script"), "{body}");
+    }
+
+    #[test]
+    fn minimal_match_cuts_at_the_segment_end() {
+        assert_eq!(
+            minimal_match("alc/x.md", "alc"),
+            Some(("alc/".into(), true))
+        );
+        assert_eq!(
+            minimal_match("alc.md", "alc"),
+            Some(("alc.md".into(), true))
+        );
+        assert_eq!(
+            minimal_match("a/xALCy/z.md", "alc"),
+            Some(("a/xALCy/".into(), false))
+        );
+        assert_eq!(
+            minimal_match("alc/x.md", "alc/"),
+            Some(("alc/".into(), true))
+        );
+        assert_eq!(minimal_match("a.md", "é"), None);
+        // a match spanning `/` is cut at the end of the segment holding its end
+        assert_eq!(
+            minimal_match("alc/xyz/a.md", "c/x"),
+            Some(("alc/xyz/".into(), false))
+        );
+        // q equal to the whole path, longer than it, and `/` alone
+        assert_eq!(
+            minimal_match("a/b.md", "a/b.md"),
+            Some(("a/b.md".into(), true))
+        );
+        assert_eq!(minimal_match("a.md", "a.md.bak"), None);
+        assert_eq!(minimal_match("a/b.md", "/"), Some(("a/".into(), false)));
     }
 
     #[test]
