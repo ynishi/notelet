@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/ynishi/notelet/compare/v0.6.0...v0.7.0) - 2026-10-19
+
+### Added
+
+- *(ui)* group path matches above body hits in search
+
 ## [0.6.0](https://github.com/ynishi/notelet/compare/v0.5.0...v0.6.0) - 2026-10-18
 
 ### Added
