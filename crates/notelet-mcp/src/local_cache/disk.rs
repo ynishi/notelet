@@ -1,4 +1,4 @@
-//! The snapshot half of the remote cache: one directory, one lock, one file.
+//! The snapshot half of the local cache: one directory, one lock, one file.
 //!
 //! ```text
 //! <dir>/lock        exclusive `File::try_lock`; whoever holds it may write

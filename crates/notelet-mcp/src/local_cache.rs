@@ -1,16 +1,17 @@
-//! [`CachedRemoteRepo`]: a read cache in front of [`RemoteNoteRepo`](crate::remote::RemoteNoteRepo), for a
+//! [`LocalCache`]: a read cache in front of [`RemoteNoteRepo`](crate::remote::RemoteNoteRepo), for a
 //! client that reads notes on the hot path. Every read of the remote costs one
-//! round trip (about 1-2 s), and a hook is a short-lived process that cannot
-//! share a stdio server's memory. The cache is a [`NoteRepo`] adapter like the
-//! others: the model, the service and the tools do not change. It is opt-in
-//! (`NOTELET_REMOTE_CACHE=1`, see [`crate::config`]) because it writes note
-//! bodies to disk, and it works the same under `stdio` and `serve`.
+//! round trip (about 1-2 s). The cache is a [`NoteRepo`] adapter like the
+//! others: the model, the service and the tools do not change. It exists only
+//! inside `notelet-mcp stdio` connected to a remote (`NOTELET_REMOTE_URL`), the
+//! local client that talks to the hosted notelet over HTTP; `serve` never uses
+//! it. It is opt-in (`NOTELET_LOCAL_CACHE=true`, see [`crate::config`]) because
+//! it writes note bodies to disk.
 //!
 //! ```text
-//! client (MCP over stdio, or loopback HTTP)
+//! client (MCP over stdio)
 //!   └ NoteService
-//!       └ CachedRemoteRepo
-//!           read  (get / get_view / list / search / dump) -> MemoryNoteRepo mirror
+//!       └ LocalCache
+//!           read  (get / get_view / list / search / dump) -> the cache's own notes (mirror)
 //!           write (put / append / delete) -> remote -> on success, update mirror
 //!           history -> remote (not cached)
 //!           poller  -> list(updated_at >= hw - 60s) every 30 s; full path relist every 10th poll
@@ -19,10 +20,13 @@
 //!
 //! # Reads
 //!
-//! The mirror is a [`MemoryNoteRepo`] (its [`mirror`](MemoryNoteRepo::mirror)
-//! and [`forget`](MemoryNoteRepo::forget) place and remove notes exactly as
-//! the remote has them), so ordering, filters, paging and search are the
-//! memory adapter's, which already keeps the Postgres contract. Once the
+//! The mirror is a map of notes owned by the cache (`store`), which places
+//! and removes notes exactly as the remote has them. The in-memory adapter of
+//! `notelet-core` cannot be used for that, because its `put` assigns the
+//! version and the time itself and the port has no way to place a note as
+//! given; so the map answers `list`, `search` and `dump` with the same
+//! ordering, filters, paging and snippets as that adapter (a test runs both on
+//! the same notes). Once the
 //! mirror is **filled** (loaded from the snapshot at start, or after the first
 //! complete pass over the remote) `get`, `get_view`, `list`, `search` and
 //! `dump` are answered from it. While it is empty they pass through to the
@@ -58,8 +62,8 @@
 //!
 //! # Polling
 //!
-//! A background task ([`CachedRemoteRepo::spawn`]) syncs every 30 s
-//! ([`CachedRemoteRepo::sync_once`]). It lists `updated_at >= hw - 60 s`,
+//! A background task ([`LocalCache::spawn`]) syncs every 30 s
+//! ([`LocalCache::sync_once`]). It lists `updated_at >= hw - 60 s`,
 //! where `hw` is the highest `updated_at` a listing of the remote has
 //! returned; the local clock is never used, so clock skew between this machine
 //! and the remote does not matter. The pages are walked to the end. A note is
@@ -91,7 +95,7 @@
 //! # Connecting
 //!
 //! With the cache on, the process starts without waiting for the remote: the
-//! background task ([`CachedRemoteRepo::spawn`], which takes the function that
+//! background task ([`LocalCache::spawn`], which takes the function that
 //! connects) fills the remote slot. While the slot is empty, reads from a
 //! filled mirror succeed. A call that needs the remote (a pass-through read,
 //! `history`, a write, a poll) does not fail at once: it connects itself,
@@ -124,11 +128,10 @@
 //! becomes a snapshot that the next start would trust. Every process reads the
 //! snapshot once at start; a process that does not hold the lock then keeps its
 //! mirror in memory, current through its own poll. Writes of the snapshot do
-//! not overlap (see [`CachedRemoteRepo::persist`]). [`CachedRemoteRepo::close`]
+//! not overlap (see [`LocalCache::persist`]). [`LocalCache::close`]
 //! writes a pending change, but the binary reaches it only when `stdio` ends
-//! at stdin EOF: `serve` has no graceful shutdown, and a signal ends either
-//! without it. Then up to one persist interval (30 s) of changes is not on
-//! disk; nothing is lost, since writes are already on the remote and the next
+//! at stdin EOF: a signal ends the process without it. Then up to one persist
+//! interval (30 s) of changes is not on disk; nothing is lost, since writes are already on the remote and the next
 //! start's relist repairs the snapshot.
 //!
 //! # Known limitations
@@ -145,15 +148,6 @@
 //!   on `updated_by` does not match the note yet. `append` is not affected (it
 //!   reads the note back).
 //!
-//! # Not chosen
-//!
-//! SQLite as the shared cache file (it conflicts with "SQL only in `pg.rs`",
-//! adds a C dependency and re-implements paging and search beside the memory
-//! and Postgres adapters); a memory-only cache (every start refetches
-//! everything and nothing can be read while the remote is unreachable); a
-//! cache per client outside notelet (every reader builds it again and MCP reads
-//! stay slow).
-//!
 //! # Shared state
 //!
 //! Request handlers and the one poll task share the mirror, the remote slot
@@ -164,8 +158,9 @@
 //! spawned task, so the rest can be driven step by step from a test.
 
 mod disk;
+mod store;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -176,13 +171,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use notelet_core::domain::{DumpEntry, Field, Filter, FilterValue, Op};
 use notelet_core::{
-    CoreError, MemoryNoteRepo, Note, NoteMeta, NotePath, NoteRepo, NoteView, Page, PageOut,
-    PutResult, Revision, RevisionMeta, SearchHit, Tail,
+    CoreError, Note, NoteMeta, NotePath, NoteRepo, NoteView, Page, PageOut, PutResult, Revision,
+    RevisionMeta, SearchHit, Tail,
 };
 use tokio::task::{JoinHandle, JoinSet};
 
 pub use disk::DiskCache;
 use disk::Snapshot;
+use store::Store;
 
 /// Seconds a delta listing reaches back from `hw`. See the module doc,
 /// "Polling".
@@ -348,9 +344,10 @@ struct State {
 }
 
 struct Core {
-    mirror: MemoryNoteRepo,
+    /// The notes, as the remote has them. Never held across an await.
+    mirror: Mutex<Store>,
     remote: Mutex<Option<Connected>>,
-    /// Opens the remote when the slot is empty; set by [`CachedRemoteRepo::spawn`].
+    /// Opens the remote when the slot is empty; set by [`LocalCache::spawn`].
     connector: Mutex<Option<Connector>>,
     /// Single-flight: held across a connect attempt.
     connecting: tokio::sync::Mutex<()>,
@@ -376,18 +373,18 @@ struct Core {
 /// A [`NoteRepo`] that answers reads from a local mirror of a remote notelet
 /// and forwards writes to it. See the module doc. Cloning shares the cache.
 #[derive(Clone)]
-pub struct CachedRemoteRepo {
+pub struct LocalCache {
     core: Arc<Core>,
 }
 
-impl CachedRemoteRepo {
+impl LocalCache {
     /// A cache with no remote yet. With `disk`, the snapshot there (if any)
     /// is loaded into the mirror, which then counts as filled; an unreadable
     /// snapshot is logged and ignored.
     pub async fn new(disk: Option<DiskCache>) -> Self {
         let disk = disk.map(Arc::new);
         let core = Core {
-            mirror: MemoryNoteRepo::default(),
+            mirror: Mutex::new(Store::default()),
             remote: Mutex::new(None),
             connector: Mutex::new(None),
             connecting: tokio::sync::Mutex::new(()),
@@ -420,19 +417,19 @@ impl CachedRemoteRepo {
                 for note in snapshot.notes {
                     // the file is ours, but a path is checked before it is trusted
                     if NotePath::parse(note.path.as_str()).is_ok() {
-                        self.core.mirror.mirror(note).await;
+                        locked(&self.core.mirror).insert(note);
                         n += 1;
                     }
                 }
                 locked(&self.core.state).hw = snapshot.hw;
                 self.core.filled.store(true, Ordering::Release);
-                tracing::info!(notes = n, writer, "remote cache: loaded the snapshot");
+                tracing::info!(notes = n, writer, "local cache: loaded the snapshot");
             }
-            Ok(Ok(None)) => tracing::info!(writer, "remote cache: no snapshot yet"),
+            Ok(Ok(None)) => tracing::info!(writer, "local cache: no snapshot yet"),
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, "remote cache: ignoring an unreadable snapshot")
+                tracing::warn!(error = %e, "local cache: ignoring an unreadable snapshot")
             }
-            Err(e) => tracing::warn!(error = %e, "remote cache: reading the snapshot failed"),
+            Err(e) => tracing::warn!(error = %e, "local cache: reading the snapshot failed"),
         }
     }
 
@@ -514,7 +511,7 @@ impl CachedRemoteRepo {
                 last.failure = None;
                 let repo = connected.repo.clone();
                 *locked(&self.core.remote) = Some(connected);
-                tracing::info!("remote cache: connected to the remote");
+                tracing::info!("local cache: connected to the remote");
                 Ok(repo)
             }
             Err(e) => {
@@ -535,7 +532,7 @@ impl CachedRemoteRepo {
     async fn place(&self, note: Note, source: Source) -> bool {
         let _g = self.core.apply.lock().await;
         let path = note.path.as_str().to_string();
-        let held = self.core.mirror.get(&note.path).await.ok().flatten();
+        let held = self.held(&note.path);
         if let Source::Refresh(expected) = source {
             if held.as_ref().map(|n| n.version) != expected {
                 return false;
@@ -551,7 +548,7 @@ impl CachedRemoteRepo {
         if held.is_some_and(|cur| cur.version >= note.version) {
             return false;
         }
-        self.core.mirror.mirror(note).await;
+        locked(&self.core.mirror).insert(note);
         let mut st = locked(&self.core.state);
         if let Some(pass) = st.pass.as_mut() {
             pass.touched.insert(path.clone());
@@ -573,10 +570,10 @@ impl CachedRemoteRepo {
 
     /// [`Self::forget`] with `apply` already held.
     async fn forget_locked(&self, path: &NotePath, deleted: Option<i64>) {
-        let cur = self.core.mirror.get(path).await.ok().flatten();
+        let cur = self.held(path);
         let version = deleted.or(cur.as_ref().map(|n| n.version));
         if cur.is_some() {
-            self.core.mirror.forget(path).await;
+            locked(&self.core.mirror).remove(path);
             self.core.dirty.store(true, Ordering::Release);
         }
         let mut st = locked(&self.core.state);
@@ -593,7 +590,7 @@ impl CachedRemoteRepo {
     /// fetched; otherwise it may only fill in a missing `updated_by`.
     async fn consider(&self, meta: &NoteMeta) -> bool {
         let _g = self.core.apply.lock().await;
-        let cur = self.core.mirror.get(&meta.path).await.ok().flatten();
+        let cur = self.held(&meta.path);
         let Some(cur) = cur else {
             return true;
         };
@@ -606,7 +603,7 @@ impl CachedRemoteRepo {
                 updated_by: meta.updated_by.clone(),
                 ..cur
             };
-            self.core.mirror.mirror(patched).await;
+            locked(&self.core.mirror).insert(patched);
             if let Some(pass) = locked(&self.core.state).pass.as_mut() {
                 pass.touched.insert(meta.path.as_str().to_string());
             }
@@ -697,7 +694,7 @@ impl CachedRemoteRepo {
             }
         }
         if full {
-            self.prune(&seen).await?;
+            self.prune(&seen).await;
         }
         Ok(top)
     }
@@ -734,40 +731,30 @@ impl CachedRemoteRepo {
 
     /// Drop the mirror entries a full listing lacks, except those placed
     /// after the pass began.
-    async fn prune(&self, seen: &HashSet<String>) -> Result<(), CoreError> {
+    async fn prune(&self, seen: &HashSet<String>) {
         let _g = self.core.apply.lock().await;
         let touched = locked(&self.core.state)
             .pass
             .as_ref()
             .map(|p| p.touched.clone())
             .unwrap_or_default();
-        let mut gone = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = Page::new(Some(Page::MAX_LIMIT), cursor)?;
-            let out = self.core.mirror.list("", &[], &page).await?;
-            for meta in out.items {
-                let p = meta.path.as_str();
-                if !seen.contains(p) && !touched.contains(p) {
-                    gone.push(meta.path);
-                }
-            }
-            match out.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
+        let mut mirror = locked(&self.core.mirror);
+        let gone: Vec<NotePath> = mirror
+            .paths()
+            .into_iter()
+            .filter(|p| !seen.contains(p.as_str()) && !touched.contains(p.as_str()))
+            .collect();
         for path in &gone {
-            self.core.mirror.forget(path).await;
+            mirror.remove(path);
         }
+        drop(mirror);
         if !gone.is_empty() {
             tracing::info!(
                 dropped = gone.len(),
-                "remote cache: dropped notes deleted elsewhere"
+                "local cache: dropped notes deleted elsewhere"
             );
             self.core.dirty.store(true, Ordering::Release);
         }
-        Ok(())
     }
 
     // ---- disk -----------------------------------------------------------
@@ -777,7 +764,7 @@ impl CachedRemoteRepo {
     /// file was written. A failed write keeps the change pending. Writes do
     /// not overlap: the blocking thread that writes holds `persist_lock` until
     /// it is done, even if the caller was cancelled meanwhile, so a later
-    /// call (the one of [`CachedRemoteRepo::close`]) always lands last.
+    /// call (the one of [`LocalCache::close`]) always lands last.
     pub async fn persist(&self) -> Result<bool, CoreError> {
         let Some(disk) = self.core.disk.clone() else {
             return Ok(false);
@@ -795,7 +782,7 @@ impl CachedRemoteRepo {
             dirty: &self.core.dirty,
             armed: true,
         };
-        let snapshot = self.snapshot().await?;
+        let snapshot = self.snapshot().await;
         pending.armed = false;
         let core = self.core.clone();
         tokio::task::spawn_blocking(move || {
@@ -812,55 +799,13 @@ impl CachedRemoteRepo {
         Ok(true)
     }
 
-    /// The mirror and `hw` as one value. Takes the notes from `list` (the
-    /// versions) and `dump` (the bodies) of the mirror, which are both
-    /// ordered by path, while no update can interleave.
-    async fn snapshot(&self) -> Result<Snapshot, CoreError> {
+    /// The mirror and `hw` as one value, taken while no update can
+    /// interleave.
+    async fn snapshot(&self) -> Snapshot {
         let _g = self.core.apply.lock().await;
         let hw = locked(&self.core.state).hw;
-        let mut metas = BTreeMap::new();
-        let mut cursor = None;
-        loop {
-            let out = self
-                .core
-                .mirror
-                .list("", &[], &Page::new(Some(Page::MAX_LIMIT), cursor)?)
-                .await?;
-            metas.extend(
-                out.items
-                    .into_iter()
-                    .map(|m| (m.path.as_str().to_string(), m)),
-            );
-            match out.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-        let mut notes = Vec::with_capacity(metas.len());
-        let mut cursor = None;
-        loop {
-            let out = self
-                .core
-                .mirror
-                .dump("", &Page::for_bodies(Some(Page::MAX_BODY_LIMIT), cursor)?)
-                .await?;
-            for DumpEntry { path, body } in out.items {
-                if let Some(m) = metas.get(path.as_str()) {
-                    notes.push(Note {
-                        path,
-                        body,
-                        version: m.version,
-                        updated_at: m.updated_at,
-                        updated_by: m.updated_by.clone(),
-                    });
-                }
-            }
-            match out.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-        Ok(Snapshot { hw, notes })
+        let notes = locked(&self.core.mirror).all();
+        Snapshot { hw, notes }
     }
 
     // ---- the task -------------------------------------------------------
@@ -878,7 +823,7 @@ impl CachedRemoteRepo {
         self.spawn_with(Timing::default(), connect);
     }
 
-    /// [`CachedRemoteRepo::spawn`] with explicit [`Timing`].
+    /// [`LocalCache::spawn`] with explicit [`Timing`].
     pub fn spawn_with<C, F>(&self, timing: Timing, connect: C)
     where
         C: Fn() -> F + Send + Sync + 'static,
@@ -906,7 +851,7 @@ impl CachedRemoteRepo {
                 tracing::warn!(
                     error = %e.chain(),
                     retry_in_secs = backoff.as_secs(),
-                    "remote cache: the remote is unreachable (disconnected); serving the last synced state"
+                    "local cache: the remote is unreachable (disconnected); serving the last synced state"
                 );
                 tokio::time::sleep(backoff).await;
                 backoff = timing.next_backoff(backoff);
@@ -914,7 +859,7 @@ impl CachedRemoteRepo {
             }
             backoff = timing.backoff_min;
             if let Err(e) = self.persist().await {
-                tracing::warn!(error = %e.chain(), "remote cache: writing the snapshot failed");
+                tracing::warn!(error = %e.chain(), "local cache: writing the snapshot failed");
             }
             tokio::time::sleep(timing.poll).await;
         }
@@ -922,7 +867,7 @@ impl CachedRemoteRepo {
 
     /// Stop the task, wait for it, and write a pending change. The explicit
     /// end of the cache: dropping it does neither. A snapshot write the task
-    /// had in flight finishes first (see [`CachedRemoteRepo::persist`]), so
+    /// had in flight finishes first (see [`LocalCache::persist`]), so
     /// the one written here is the last.
     pub async fn close(&self) {
         let task = locked(&self.core.task).take();
@@ -931,16 +876,16 @@ impl CachedRemoteRepo {
             let _ = task.await;
         }
         if let Err(e) = self.persist().await {
-            tracing::warn!(error = %e.chain(), "remote cache: writing the snapshot failed");
+            tracing::warn!(error = %e.chain(), "local cache: writing the snapshot failed");
         }
     }
 }
 
 #[async_trait]
-impl NoteRepo for CachedRemoteRepo {
+impl NoteRepo for LocalCache {
     async fn get(&self, path: &NotePath) -> Result<Option<Note>, CoreError> {
         if self.serves_from_mirror() {
-            return self.core.mirror.get(path).await;
+            return Ok(self.held(path));
         }
         let got = self.remote().await?.get(path).await?;
         if got.is_none() {
@@ -951,7 +896,7 @@ impl NoteRepo for CachedRemoteRepo {
 
     async fn get_view(&self, path: &NotePath, tail: &Tail) -> Result<Option<NoteView>, CoreError> {
         if self.serves_from_mirror() {
-            return self.core.mirror.get_view(path, tail).await;
+            return Ok(self.held(path).map(|n| NoteView::of(n, tail)));
         }
         let got = self.remote().await?.get_view(path, tail).await?;
         if got.is_none() {
@@ -969,8 +914,7 @@ impl NoteRepo for CachedRemoteRepo {
     ) -> Result<PutResult, CoreError> {
         match self.remote().await?.put(path, body, expected, by).await {
             Ok(done) => {
-                let behind =
-                    !done.changed && self.mirror_version(path).await < Some(done.note.version);
+                let behind = !done.changed && self.mirror_version(path) < Some(done.note.version);
                 if behind {
                     // nothing was written, and the answer's note has no
                     // `updated_by`: take the remote's own copy
@@ -1011,7 +955,7 @@ impl NoteRepo for CachedRemoteRepo {
         page: &Page,
     ) -> Result<PageOut<NoteMeta>, CoreError> {
         if self.serves_from_mirror() {
-            return self.core.mirror.list(prefix, filters, page).await;
+            return Ok(locked(&self.core.mirror).list(prefix, filters, page));
         }
         self.remote().await?.list(prefix, filters, page).await
     }
@@ -1023,7 +967,7 @@ impl NoteRepo for CachedRemoteRepo {
         page: &Page,
     ) -> Result<PageOut<SearchHit>, CoreError> {
         if self.serves_from_mirror() {
-            return self.core.mirror.search(text, prefix, page).await;
+            return Ok(locked(&self.core.mirror).search(text, prefix, page));
         }
         self.remote().await?.search(text, prefix, page).await
     }
@@ -1042,17 +986,21 @@ impl NoteRepo for CachedRemoteRepo {
 
     async fn dump(&self, prefix: &str, page: &Page) -> Result<PageOut<DumpEntry>, CoreError> {
         if self.serves_from_mirror() {
-            return self.core.mirror.dump(prefix, page).await;
+            return Ok(locked(&self.core.mirror).dump(prefix, page));
         }
         self.remote().await?.dump(prefix, page).await
     }
 }
 
-impl CachedRemoteRepo {
+impl LocalCache {
     /// The version the mirror holds for `path`.
-    async fn mirror_version(&self, path: &NotePath) -> Option<i64> {
-        let held = self.core.mirror.get(path).await.ok().flatten();
-        held.map(|n| n.version)
+    fn mirror_version(&self, path: &NotePath) -> Option<i64> {
+        self.held(path).map(|n| n.version)
+    }
+
+    /// The note the mirror holds at `path`.
+    fn held(&self, path: &NotePath) -> Option<Note> {
+        locked(&self.core.mirror).get(path)
     }
 
     /// Read `path` from the remote and bring the mirror to it (newer
@@ -1061,7 +1009,7 @@ impl CachedRemoteRepo {
     /// while the read was in flight wins, and the next poll repairs the rest.
     /// Best effort: a failure leaves the mirror as it is.
     async fn refresh(&self, path: &NotePath) {
-        let held = self.mirror_version(path).await;
+        let held = self.mirror_version(path);
         let Ok(remote) = self.remote().await else {
             return;
         };
@@ -1071,7 +1019,7 @@ impl CachedRemoteRepo {
             }
             Ok(None) => {
                 let _g = self.core.apply.lock().await;
-                if self.mirror_version(path).await == held {
+                if self.mirror_version(path) == held {
                     self.forget_locked(path, None).await;
                 }
             }
@@ -1097,6 +1045,7 @@ impl CachedRemoteRepo {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
+    use notelet_core::MemoryNoteRepo;
     use tokio::sync::Notify;
 
     use super::disk::testing::TempDir;
@@ -1263,9 +1212,9 @@ mod tests {
     }
 
     /// A cache with a spy remote connected, mirror empty.
-    async fn fixture() -> (Arc<Spy>, CachedRemoteRepo) {
+    async fn fixture() -> (Arc<Spy>, LocalCache) {
         let spy = Arc::new(Spy::default());
-        let cache = CachedRemoteRepo::new(None).await;
+        let cache = LocalCache::new(None).await;
         cache.set_remote(spy.clone());
         (spy, cache)
     }
@@ -1500,7 +1449,7 @@ mod tests {
         assert!(!cache.is_filled());
         spy.inner.delete(&n.path, 1, "other").await.unwrap();
         assert!(cache.get(&n.path).await.unwrap().is_none());
-        assert!(cache.core.mirror.get(&n.path).await.unwrap().is_none());
+        assert!(cache.held(&n.path).is_none());
     }
 
     #[tokio::test]
@@ -1544,7 +1493,7 @@ mod tests {
         }
 
         // an unfilled cache has nothing to answer from either
-        let empty = CachedRemoteRepo::new(None).await;
+        let empty = LocalCache::new(None).await;
         let err = empty.get(&p("a/1.md")).await.unwrap_err();
         assert!(is_storage(&err), "{err}");
         assert!(empty.list("", &[], &page()).await.is_err());
@@ -1576,7 +1525,7 @@ mod tests {
         other(&spy, "a/1.md", "one").await;
         other(&spy, "a/2.md", "two").await;
 
-        let writer = CachedRemoteRepo::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
+        let writer = LocalCache::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
         assert!(!writer.is_filled(), "no snapshot yet");
         writer.set_remote(spy.clone());
         // an unfilled mirror is never written
@@ -1591,7 +1540,7 @@ mod tests {
         assert!(writer.persist().await.unwrap());
 
         // a second process: reader, but it starts from the snapshot
-        let reader = CachedRemoteRepo::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
+        let reader = LocalCache::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
         assert!(reader.is_filled());
         assert!(!reader.is_connected());
         let notes = reader.list("", &[], &page()).await.unwrap().items;
@@ -1605,7 +1554,7 @@ mod tests {
 
         // the writer's file is intact and has the hw, the reader's change is not in it
         drop((writer, reader));
-        let next = CachedRemoteRepo::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
+        let next = LocalCache::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
         assert_eq!(next.list("", &[], &page()).await.unwrap().items.len(), 4);
         assert!(locked(&next.core.state).hw.is_some());
     }
@@ -1617,7 +1566,7 @@ mod tests {
         other(&spy, "a/1.md", "one").await;
         let gone = other(&spy, "a/2.md", "two").await;
         {
-            let first = CachedRemoteRepo::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
+            let first = LocalCache::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
             first.set_remote(spy.clone());
             first.sync_once().await.unwrap();
             first.close().await;
@@ -1625,7 +1574,7 @@ mod tests {
         spy.inner.delete(&gone.path, 1, "other").await.unwrap();
         other(&spy, "a/1.md", "newer").await;
 
-        let again = CachedRemoteRepo::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
+        let again = LocalCache::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
         assert!(again.is_filled());
         assert_eq!(again.get(&gone.path).await.unwrap().unwrap().body, "two");
         again.set_remote(spy.clone());
@@ -1657,7 +1606,7 @@ mod tests {
         let tmp = TempDir::new("task");
         let (spy, _) = fixture().await;
         other(&spy, "a/1.md", "one").await;
-        let cache = CachedRemoteRepo::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
+        let cache = LocalCache::new(Some(DiskCache::open(tmp.0.clone()).unwrap())).await;
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let timing = Timing {
@@ -1727,7 +1676,7 @@ mod tests {
     async fn a_cold_start_call_waits_for_the_connect_instead_of_failing() {
         let spy = Arc::new(Spy::default());
         other(&spy, "a/1.md", "one").await;
-        let cache = CachedRemoteRepo::new(None).await;
+        let cache = LocalCache::new(None).await;
         let attempts = Arc::new(AtomicUsize::new(0));
         cache.spawn_with(slow_task(), {
             let (spy, attempts) = (spy.clone(), attempts.clone());
@@ -1759,7 +1708,7 @@ mod tests {
 
     #[tokio::test]
     async fn callers_that_waited_for_a_failed_attempt_share_its_failure() {
-        let cache = CachedRemoteRepo::new(None).await;
+        let cache = LocalCache::new(None).await;
         let attempts = Arc::new(AtomicUsize::new(0));
         cache.spawn_with(slow_task(), {
             let attempts = attempts.clone();
@@ -1809,7 +1758,7 @@ mod tests {
     async fn a_client_shown_to_be_dead_is_replaced_on_demand() {
         let spy = Arc::new(Spy::default());
         other(&spy, "a/1.md", "one").await;
-        let cache = CachedRemoteRepo::new(None).await;
+        let cache = LocalCache::new(None).await;
         let dead = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(AtomicUsize::new(0));
         cache.spawn_with(slow_task(), {
@@ -1895,6 +1844,105 @@ mod tests {
         assert!(!done.changed);
         let got = cache.get(&n.path).await.unwrap().unwrap();
         assert_eq!((got.version, got.updated_by.as_str()), (2, "other"));
+    }
+
+    /// How long a read that must not wait for the fill may take in a test.
+    const PROMPT: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn a_read_during_a_slow_fill_goes_to_the_remote_without_waiting_for_the_fill() {
+        let (spy, cache) = fixture().await;
+        for i in 0..3 {
+            other(&spy, &format!("a/{i}.md"), "body").await;
+        }
+        // the fill is held inside the fetch of its first body
+        let gate = spy.gate_get();
+        let fill = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.sync_once().await }
+        });
+        gate.reached.notified().await;
+        assert!(!cache.is_filled());
+
+        let gets = spy.gets();
+        let read = tokio::time::timeout(PROMPT, async {
+            let got = cache.get(&p("a/2.md")).await.unwrap().unwrap();
+            let view = cache.get_view(&p("a/1.md"), &Tail::whole()).await;
+            let listed = cache.list("", &[], &page()).await.unwrap();
+            (got, view.unwrap().unwrap(), listed)
+        })
+        .await
+        .expect("the read waited for the fill");
+        assert_eq!(read.0.body, "body");
+        assert_eq!(read.2.items.len(), 3);
+        assert!(spy.gets() >= gets + 2, "both reads went to the remote");
+        assert!(!cache.is_filled(), "the fill is still held");
+
+        gate.release.notify_one();
+        fill.await.unwrap().unwrap();
+        assert!(cache.is_filled());
+    }
+
+    #[tokio::test]
+    async fn a_read_while_the_fill_waits_for_a_listing_does_not_wait_for_it_either() {
+        let (spy, cache) = fixture().await;
+        other(&spy, "a/1.md", "one").await;
+        let gate = spy.gate_list();
+        let fill = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.sync_once().await }
+        });
+        gate.reached.notified().await;
+
+        let got = tokio::time::timeout(PROMPT, cache.get(&p("a/1.md")))
+            .await
+            .expect("the read waited for the fill");
+        assert_eq!(got.unwrap().unwrap().body, "one");
+        assert!(!cache.is_filled());
+
+        gate.release.notify_one();
+        fill.await.unwrap().unwrap();
+        assert!(cache.is_filled());
+    }
+
+    #[tokio::test]
+    async fn a_cold_start_read_waits_for_the_connect_and_not_for_the_fill_that_follows() {
+        let spy = Arc::new(Spy::default());
+        for i in 0..3 {
+            other(&spy, &format!("a/{i}.md"), "body").await;
+        }
+        let gate = spy.gate_get();
+        let cache = LocalCache::new(None).await;
+        // the task connects (after a delay) and then starts its fill, which
+        // the gate holds in its first body fetch
+        cache.spawn_with(slow_task(), {
+            let spy = spy.clone();
+            move || {
+                let spy = spy.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(Connected::new(spy))
+                }
+            }
+        });
+
+        let got = tokio::time::timeout(PROMPT, cache.get_view(&p("a/1.md"), &Tail::whole()))
+            .await
+            .expect("the read waited for more than the connect");
+        assert_eq!(got.unwrap().unwrap().body, "body");
+        assert!(!cache.is_filled(), "the read did not wait for the fill");
+        // the fill does run: it reaches its gate, and finishes when released
+        tokio::time::timeout(PROMPT, gate.reached.notified())
+            .await
+            .expect("the fill never started");
+        gate.release.notify_one();
+        let c = cache.clone();
+        eventually("the fill", || {
+            let c = c.clone();
+            async move { c.is_filled() }
+        })
+        .await;
+        cache.close().await;
     }
 
     #[test]

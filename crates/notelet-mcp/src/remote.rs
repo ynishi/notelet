@@ -25,9 +25,9 @@
 //! hit it once; a transport error is returned to the call that met it and
 //! to no other. The process does not start if the remote is unreachable or
 //! refuses the token: [`RemoteNoteRepo::connect`] performs the handshake.
-//! That is the plain remote. With `NOTELET_REMOTE_CACHE=1` the binary wraps
-//! it in [`crate::cache::CachedRemoteRepo`], which calls `connect` from a
-//! background task instead (and from any call that finds no connection), so
+//! That is the plain remote. Under `stdio` with `NOTELET_LOCAL_CACHE=true` the
+//! binary wraps it in [`crate::local_cache::LocalCache`], which calls `connect`
+//! from a background task instead (and from any call that finds no connection), so
 //! the process starts at once and a connect that fails is retried with a
 //! back-off; the cache then answers reads from its mirror and uses this
 //! adapter for writes, `history` and the polling.
@@ -224,7 +224,7 @@ impl RemoteNoteRepo {
     /// does not report through the service's own flag when the worker quits
     /// on a fatal error), or the service was cancelled or has ended. A client
     /// whose calls merely fail is not closed: it re-opens an expired session
-    /// by itself (see the module doc). The read cache uses this to decide to
+    /// by itself (see the module doc). The local cache uses this to decide to
     /// connect anew.
     pub fn is_closed(&self) -> bool {
         self.client.peer().is_transport_closed() || self.client.is_closed()
