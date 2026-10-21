@@ -2,6 +2,18 @@
 //! adapter's semantics (ordering by path, keyset paging, LIKE patterns,
 //! revision on replace and delete, no-op on an identical body) so the service tests exercise the same contract the
 //! binary will meet in production.
+//!
+//! It also backs the read cache of the remote adapter in `notelet-mcp`
+//! (`CachedRemoteRepo`), which keeps a copy of another notelet's notes here
+//! and answers reads from it, so ordering, filters, paging and search are
+//! this adapter's and need no second implementation. For that the copy is
+//! maintained from outside the port by two inherent methods:
+//! [`MemoryNoteRepo::mirror`] places a note exactly as the remote stored it
+//! (version and `updated_at` included, no revision recorded) and
+//! [`MemoryNoteRepo::forget`] removes one (again no revision). The port's own
+//! writes (`put`, `append`, `delete`) keep assigning versions and recording
+//! revisions, so a repo is either the store (driven through the port) or a
+//! copy (driven through these two), not both; a copy has no history.
 
 use std::collections::BTreeMap;
 
@@ -20,6 +32,26 @@ use crate::port::{NoteRepo, PutResult};
 #[derive(Default)]
 pub struct MemoryNoteRepo {
     inner: Mutex<Inner>,
+}
+
+impl MemoryNoteRepo {
+    /// Place `note` exactly as given, replacing any note at its path: the
+    /// version, `updated_at` and `updated_by` are the caller's, nothing is
+    /// assigned and no revision is recorded. This is how a copy of another
+    /// store is kept (see the module doc); it is not a write of the port, so
+    /// it takes no expected version and never conflicts. The caller decides
+    /// whether `note` is newer than what is held.
+    pub async fn mirror(&self, note: Note) {
+        let mut g = self.inner.lock().await;
+        g.notes.insert(note.path.as_str().to_string(), note);
+    }
+
+    /// Remove the note at `path`, if any, recording no revision (the
+    /// counterpart of [`MemoryNoteRepo::mirror`]; `delete` of the port keeps
+    /// the body as a revision and checks the version).
+    pub async fn forget(&self, path: &NotePath) {
+        self.inner.lock().await.notes.remove(path.as_str());
+    }
 }
 
 #[derive(Default)]
@@ -398,5 +430,48 @@ mod tests {
     fn find_lowercase_maps_back_to_the_original_char() {
         assert_eq!(find_lowercase("\u{23A}\u{23A}x", "x"), Some(4));
         assert_eq!(find_lowercase("abc", "z"), None);
+    }
+
+    fn note(path: &str, body: &str, version: i64, by: &str) -> Note {
+        Note {
+            path: NotePath::parse(path).unwrap(),
+            body: body.to_string(),
+            version,
+            updated_at: Utc::now(),
+            updated_by: by.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_places_a_note_exactly_as_given() {
+        let repo = MemoryNoteRepo::default();
+        let n = note("n/a.md", "one", 7, "alice");
+        repo.mirror(n.clone()).await;
+        assert_eq!(repo.get(&n.path).await.unwrap(), Some(n.clone()));
+        // no revision was recorded, so there is no history
+        assert!(repo.history(&n.path, 10).await.unwrap().is_empty());
+        // a second mirror replaces it, even with a lower version
+        let older = note("n/a.md", "zero", 3, "bob");
+        repo.mirror(older.clone()).await;
+        assert_eq!(repo.get(&n.path).await.unwrap(), Some(older));
+        // reads see it like any note
+        let page = Page::new(None, None).unwrap();
+        assert_eq!(repo.list("n/", &[], &page).await.unwrap().items.len(), 1);
+        assert_eq!(repo.search("zero", "", &page).await.unwrap().items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forget_removes_without_a_revision() {
+        let repo = MemoryNoteRepo::default();
+        let n = note("n/a.md", "one", 2, "alice");
+        repo.mirror(n.clone()).await;
+        repo.forget(&n.path).await;
+        assert_eq!(repo.get(&n.path).await.unwrap(), None);
+        assert!(repo.history(&n.path, 10).await.unwrap().is_empty());
+        // forgetting an absent path is a no-op
+        repo.forget(&n.path).await;
+        // a note created afterwards starts from 1: nothing was kept
+        let created = repo.put(&n.path, "again", None, "t").await.unwrap();
+        assert_eq!(created.note.version, 1);
     }
 }
