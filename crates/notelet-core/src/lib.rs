@@ -87,7 +87,7 @@
 //! | [`port`] | the [`port::NoteRepo`] trait the service depends on |
 //! | [`service`] | [`service::NoteService`]: validation, then one repo call |
 //! | [`pg`] | the Postgres adapter (sqlx); the only module that knows SQL |
-//! | [`memory`] | an in-memory adapter for tests and dry runs |
+//! | [`memory`] | an in-memory adapter for tests and dry runs; it also holds the copy that backs the remote adapter's read cache in `notelet-mcp` |
 //!
 //! Everything a transport (the MCP binary) needs is [`service::NoteService`];
 //! it never touches the repository directly.

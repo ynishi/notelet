@@ -24,6 +24,7 @@ path = "src/main.rs"
 notelet-core = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
+chrono = { workspace = true }
 getrandom = "0.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
