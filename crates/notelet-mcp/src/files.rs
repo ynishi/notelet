@@ -182,7 +182,7 @@ impl Drop for TmpFile {
 }
 
 /// Replace `path` with `bytes` (see the module doc, "Writing"). Also the
-/// way the remote cache writes its snapshot ([`crate::cache`]).
+/// way the local cache writes its snapshot ([`crate::local_cache`]).
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path
         .parent()

@@ -7,7 +7,7 @@
 //! | `NOTELET_REMOTE_URL` | MCP endpoint of another notelet (`http(s)://host/mcp`): `serve` and `stdio` use it as their store instead of Postgres (see [`crate::remote`]) | none |
 //! | `NOTELET_REMOTE_TOKEN` | bearer token presented to the remote; it selects the actor the remote records | none |
 //! | `NOTELET_REMOTE_TOKEN_FILE` | read that token from this file instead (wins over `NOTELET_REMOTE_TOKEN`; trailing newline stripped) | none |
-//! | `NOTELET_REMOTE_CACHE` | `1` switches on the read cache of the remote store (see [`crate::cache`]): reads come from a local copy kept current by polling, and the copy is kept on disk under `$XDG_CACHE_HOME/notelet/<key>/` (else `$HOME/.cache`, on macOS `$HOME/Library/Caches`). Only meaningful with `NOTELET_REMOTE_URL`; with a database it stops startup. `0` or unset is off; anything else is refused | off |
+//! | `NOTELET_LOCAL_CACHE` | `true` switches on the local cache of `stdio` with a remote store (see [`crate::local_cache`]): reads come from a local copy kept current by polling, and the copy is kept on disk under `$XDG_CACHE_HOME/notelet/<key>/` (else `$HOME/.cache`, on macOS `$HOME/Library/Caches`). Read only by `stdio` with `NOTELET_REMOTE_URL`, as a boolean: unset or empty is `false`, anything but `true` or `false` stops that start. No other command reads it | `false` |
 //! | `NOTELET_TOKENS` | credentials, one per client: entries `<actor>:<sha256 hex of the token>` separated by whitespace; a request's token selects the actor written to `updated_by` | none |
 //! | `NOTELET_TOKENS_FILE` | read the entries from this file instead (wins over `NOTELET_TOKENS`); same format | none |
 //! | `NOTELET_TOKEN` | one bearer token, written as `NOTELET_ACTOR`; joins the table above | none |
@@ -34,9 +34,6 @@
 //! error naming the variable to unset. A global `DATABASE_URL` counts as a
 //! database URL, so it makes a remote start refuse; `NOTELET_DATABASE_URL=`
 //! set to empty takes precedence over it and masks it (empty is unset).
-//! `NOTELET_REMOTE_CACHE=1` is refused with a database backend (it would be
-//! ignored silently otherwise, and the cache writes note bodies to disk, so
-//! "on" must mean on). The value is checked wherever it is read, remote or not.
 //! The remote token variables are read only when `NOTELET_REMOTE_URL` is set. `NOTELET_REMOTE_TOKEN[_FILE]` is
 //! separate from `NOTELET_TOKEN[_FILE]`: the first is the credential this
 //! process presents upstream, the second is one it accepts from its clients.
@@ -67,13 +64,38 @@ pub struct RemoteConfig {
     pub url: String,
     /// Bearer token for the remote; `None` for a remote without tokens.
     pub token: Option<String>,
-    /// `NOTELET_REMOTE_CACHE=1`: wrap the remote in the read cache of
-    /// [`crate::cache`].
+    /// `NOTELET_LOCAL_CACHE=true`: `stdio` wraps the remote in the
+    /// [`crate::local_cache`]. Set only by [`Backend::read_local_cache_env`],
+    /// which only `stdio` calls.
     pub cache: bool,
     /// Where the cache keeps its snapshot ([`cache_dir`]); `None` when the
     /// cache is off or no home directory could be found (the cache then
     /// lives in memory only).
     pub cache_dir: Option<PathBuf>,
+}
+
+impl RemoteConfig {
+    /// [`Backend::read_local_cache_env`] with the environment passed in.
+    fn set_local_cache(
+        &mut self,
+        switch: Option<&str>,
+        xdg_cache_home: Option<&str>,
+        home: Option<&str>,
+        macos: bool,
+    ) -> anyhow::Result<()> {
+        self.cache = match switch.filter(|v| !v.is_empty()) {
+            Some(v) => v
+                .parse::<bool>()
+                .with_context(|| "NOTELET_LOCAL_CACHE must be true or false")?,
+            None => false,
+        };
+        self.cache_dir = if self.cache {
+            cache_dir(&self.url, xdg_cache_home, home, macos)
+        } else {
+            None
+        };
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for RemoteConfig {
@@ -88,6 +110,25 @@ impl std::fmt::Debug for RemoteConfig {
 }
 
 impl Backend {
+    /// Switch the local cache on for a remote backend when
+    /// `NOTELET_LOCAL_CACHE` says so, and resolve its directory. Only
+    /// `stdio` calls this; every other command never reads the variable, so
+    /// whatever it holds cannot stop them. Unset or empty is `false`; any
+    /// other value must be `true` or `false` (the value is not echoed). With
+    /// a database backend the variable is not read at all.
+    pub fn read_local_cache_env(&mut self) -> anyhow::Result<()> {
+        if let Self::Remote(r) = self {
+            let switch = std::env::var("NOTELET_LOCAL_CACHE").ok();
+            r.set_local_cache(
+                switch.as_deref(),
+                std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+                std::env::var("HOME").ok().as_deref(),
+                cfg!(target_os = "macos"),
+            )?;
+        }
+        Ok(())
+    }
+
     /// The connection string, for the commands that need the database
     /// (`migrate`, `import`, `export`). `command` names the caller in the
     /// error when the backend is remote.
@@ -100,17 +141,6 @@ impl Backend {
                  can use a remote)"
             ),
         }
-    }
-}
-
-/// `NOTELET_REMOTE_CACHE`: `1` is on; unset, empty and `0` are off; any other
-/// value is refused rather than guessed at, since "on" writes note bodies to
-/// disk.
-fn parse_remote_cache(raw: Option<&str>) -> anyhow::Result<bool> {
-    match raw {
-        None | Some("" | "0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(_) => anyhow::bail!("NOTELET_REMOTE_CACHE must be 1 or 0"),
     }
 }
 
@@ -147,12 +177,10 @@ pub fn cache_dir(
 }
 
 /// Choose the backend from the raw values. Empty strings count as unset.
-/// `cache` is `NOTELET_REMOTE_CACHE`; it only makes sense for a remote.
 fn resolve_backend(
     database_url: Option<String>,
     remote_url: Option<String>,
     remote_token: Option<String>,
-    cache: bool,
 ) -> anyhow::Result<Backend> {
     let database_url = database_url.filter(|v| !v.is_empty());
     let remote_url = remote_url.filter(|v| !v.is_empty());
@@ -160,10 +188,6 @@ fn resolve_backend(
         (Some(_), Some(_)) => anyhow::bail!(
             "NOTELET_REMOTE_URL and NOTELET_DATABASE_URL (or DATABASE_URL) are both set: \
              choose one store"
-        ),
-        (Some(_), None) if cache => anyhow::bail!(
-            "NOTELET_REMOTE_CACHE=1 needs NOTELET_REMOTE_URL: the cache is for a remote store, \
-             not for a database (unset it, or switch to a remote)"
         ),
         (Some(url), None) => Ok(Backend::Database(url)),
         (None, Some(url)) => {
@@ -174,7 +198,7 @@ fn resolve_backend(
             Ok(Backend::Remote(RemoteConfig {
                 url,
                 token: remote_token.filter(|t| !t.is_empty()),
-                cache,
+                cache: false,
                 cache_dir: None,
             }))
         }
@@ -247,18 +271,7 @@ impl Config {
         } else {
             None
         };
-        let cache = parse_remote_cache(std::env::var("NOTELET_REMOTE_CACHE").ok().as_deref())?;
-        let mut backend = resolve_backend(database_url, remote_url, remote_token, cache)?;
-        if let Backend::Remote(r) = &mut backend {
-            if r.cache {
-                r.cache_dir = cache_dir(
-                    &r.url,
-                    std::env::var("XDG_CACHE_HOME").ok().as_deref(),
-                    std::env::var("HOME").ok().as_deref(),
-                    cfg!(target_os = "macos"),
-                );
-            }
-        }
+        let backend = resolve_backend(database_url, remote_url, remote_token)?;
 
         let actor = fallback_actor(std::env::var("NOTELET_ACTOR").ok())?;
 
@@ -483,7 +496,7 @@ mod tests {
 
     #[test]
     fn remote_and_database_together_refuse_to_start() {
-        let err = resolve_backend(some("pg://x"), some("http://127.0.0.1:1/mcp"), None, false)
+        let err = resolve_backend(some("pg://x"), some("http://127.0.0.1:1/mcp"), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("both set"), "{err}");
@@ -495,13 +508,8 @@ mod tests {
 
     #[test]
     fn remote_alone_needs_no_database_url() {
-        let b = resolve_backend(
-            None,
-            some("http://127.0.0.1:1/mcp"),
-            some("s3cr3t-value"),
-            false,
-        )
-        .unwrap();
+        let b =
+            resolve_backend(None, some("http://127.0.0.1:1/mcp"), some("s3cr3t-value")).unwrap();
         let Backend::Remote(r) = b else {
             panic!("expected remote")
         };
@@ -514,7 +522,7 @@ mod tests {
             "{dbg}"
         );
         // empty values are unset
-        let b = resolve_backend(some(""), some("http://h/mcp"), some(""), false).unwrap();
+        let b = resolve_backend(some(""), some("http://h/mcp"), some("")).unwrap();
         assert!(matches!(
             b,
             Backend::Remote(RemoteConfig { token: None, .. })
@@ -523,41 +531,47 @@ mod tests {
 
     #[test]
     fn a_store_is_required_and_a_remote_url_must_be_http() {
-        let err = resolve_backend(None, None, None, false)
-            .unwrap_err()
-            .to_string();
+        let err = resolve_backend(None, None, None).unwrap_err().to_string();
         assert!(err.contains("NOTELET_DATABASE_URL"), "{err}");
-        assert!(resolve_backend(None, some("ftp://h"), None, false).is_err());
+        assert!(resolve_backend(None, some("ftp://h"), None).is_err());
         assert_eq!(
-            resolve_backend(some("pg://x"), None, None, false).unwrap(),
+            resolve_backend(some("pg://x"), None, None).unwrap(),
             Backend::Database("pg://x".into())
         );
     }
 
     #[test]
-    fn remote_cache_is_one_or_zero_and_needs_a_remote() {
-        assert!(parse_remote_cache(Some("1")).unwrap());
-        for off in [None, Some(""), Some("0")] {
-            assert!(!parse_remote_cache(off).unwrap());
-        }
-        let err = parse_remote_cache(Some("yes")).unwrap_err().to_string();
-        assert!(err.contains("NOTELET_REMOTE_CACHE"), "{err}");
-        // with a database it stops startup, naming the variable but no value
-        let err = resolve_backend(some("pg://x"), None, None, true)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("NOTELET_REMOTE_CACHE") && !err.contains("pg://x"),
-            "{err}"
-        );
-        // with a remote it is carried through; the directory is resolved later
-        let b = resolve_backend(None, some("http://h/mcp"), None, true).unwrap();
-        let Backend::Remote(r) = b else {
-            panic!("expected remote")
+    fn the_local_cache_switch_is_a_bool_read_only_for_a_remote() {
+        let remote = || match resolve_backend(None, some("http://h/mcp"), None).unwrap() {
+            Backend::Remote(r) => r,
+            Backend::Database(_) => panic!("expected remote"),
         };
-        assert!(r.cache && r.cache_dir.is_none());
-        // off with a database is fine
-        assert!(resolve_backend(some("pg://x"), None, None, false).is_ok());
+        // off by default: a resolved backend never carries the switch
+        let mut r = remote();
+        assert!(!r.cache && r.cache_dir.is_none());
+        for off in [None, Some(""), Some("false")] {
+            r.set_local_cache(off, Some("/x"), None, false).unwrap();
+            assert!(!r.cache && r.cache_dir.is_none());
+        }
+        // on: the directory is resolved too
+        r.set_local_cache(Some("true"), Some("/x"), None, false)
+            .unwrap();
+        assert!(r.cache && r.cache_dir.is_some());
+        // anything else is refused, naming the variable
+        for bad in ["1", "0", "yes", "TRUE"] {
+            let err = remote()
+                .set_local_cache(Some(bad), Some("/x"), None, false)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("NOTELET_LOCAL_CACHE") && !err.contains(bad),
+                "{err}"
+            );
+        }
+        // a database backend never reads it, so it cannot fail there
+        let mut db = resolve_backend(some("pg://x"), None, None).unwrap();
+        db.read_local_cache_env().unwrap();
+        assert_eq!(db, Backend::Database("pg://x".into()));
     }
 
     #[test]
@@ -594,7 +608,7 @@ mod tests {
 
     #[test]
     fn database_commands_fail_clearly_on_a_remote() {
-        let remote = resolve_backend(None, some("http://h/mcp"), None, false).unwrap();
+        let remote = resolve_backend(None, some("http://h/mcp"), None).unwrap();
         for cmd in ["migrate", "import", "export"] {
             let err = remote.database_url(cmd).unwrap_err().to_string();
             assert!(

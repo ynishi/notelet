@@ -11,9 +11,9 @@
 //!
 //! Configuration is environment only (see [`config`]): a database URL (or,
 //! for `serve` and `stdio`, the URL and token of a remote notelet in its
-//! place, see [`remote`]; with `NOTELET_REMOTE_CACHE=1` behind a read cache
-//! that starts without waiting for the remote, see [`cache`]), bearer tokens (each mapped to the actor it
-//! writes as), a bind address, a fallback actor name. There is no config file,
+//! place, see [`remote`]; under `stdio` with `NOTELET_LOCAL_CACHE=true` behind
+//! a local cache that starts without waiting for the remote, see
+//! [`local_cache`]), bearer tokens (each mapped to the actor it writes as), a bind address, a fallback actor name. There is no config file,
 //! because the host (Fly, systemd, a shell) already has a way to set
 //! environment variables and a second mechanism would have to be kept in
 //! agreement with it.
@@ -27,9 +27,9 @@
 //! [`render`].
 
 mod auth;
-mod cache;
 mod config;
 mod files;
+mod local_cache;
 mod remote;
 mod render;
 mod resources;
@@ -42,8 +42,8 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use notelet_core::{NoteRepo, NoteService, PgNoteRepo};
 
-use crate::cache::{CachedRemoteRepo, Connected, DiskCache};
 use crate::config::{Backend, Config};
+use crate::local_cache::{Connected, DiskCache, LocalCache};
 use crate::remote::RemoteNoteRepo;
 
 #[derive(Parser)]
@@ -165,7 +165,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd.unwrap_or(Cmd::Serve) {
         Cmd::Stdio => {
             cfg.check_file_root()?;
-            let (repo, cache) = open_serving_repo(&backend).await?;
+            let mut backend = backend;
+            backend.read_local_cache_env()?;
+            let (repo, cache) = open_stdio_repo(&backend).await?;
             let svc = Arc::new(NoteService::new(repo));
             let ran =
                 server::run_stdio(svc, cfg.actor, cfg.file_root.map(files::FileRoot::new)).await;
@@ -174,11 +176,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Serve => {
             cfg.check_file_root()?;
-            let (repo, cache) = open_serving_repo(&backend).await?;
-            let svc = Arc::new(NoteService::new(repo));
-            let ran = server::run_http(svc, cfg).await;
-            close_cache(cache).await;
-            ran
+            let svc = Arc::new(NoteService::new(open_serving_repo(&backend).await?));
+            server::run_http(svc, cfg).await
         }
         Cmd::Migrate => {
             let repo = PgNoteRepo::connect(backend.database_url("migrate")?).await?;
@@ -215,67 +214,69 @@ async fn main() -> anyhow::Result<()> {
 
 /// The store `serve` and `stdio` run on: Postgres (migrated on start), or
 /// the remote notelet, in which case nothing is migrated and no database is
-/// touched. A plain remote is connected here, so an unreachable one stops the
-/// start. With `NOTELET_REMOTE_CACHE=1` the remote is wrapped in the read
-/// cache of [`cache`] instead and nothing is awaited: the cache connects in
-/// the background (or in the first call that needs the remote), and starts
-/// answering at once if it has a snapshot. The
-/// cache is also returned, so that its end can be run (see [`close_cache`]).
-async fn open_serving_repo(
-    backend: &Backend,
-) -> anyhow::Result<(Arc<dyn NoteRepo>, Option<CachedRemoteRepo>)> {
+/// touched. A remote is connected here, so an unreachable one stops the start.
+async fn open_serving_repo(backend: &Backend) -> anyhow::Result<Arc<dyn NoteRepo>> {
     Ok(match backend {
         Backend::Database(url) => {
             let repo = PgNoteRepo::connect(url).await?;
             repo.migrate().await?;
-            (Arc::new(repo), None)
-        }
-        Backend::Remote(r) if r.cache => {
-            let disk = match r.cache_dir.clone() {
-                Some(dir) => match tokio::task::spawn_blocking(move || DiskCache::open(dir)).await?
-                {
-                    Ok(disk) => Some(disk),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "remote cache: the cache directory is unusable; keeping the cache in memory only");
-                        None
-                    }
-                },
-                None => {
-                    tracing::warn!("remote cache: no cache directory (neither XDG_CACHE_HOME nor HOME is an absolute path); keeping the cache in memory only");
-                    None
-                }
-            };
-            let cache = CachedRemoteRepo::new(disk).await;
-            let (url, token) = (r.url.clone(), r.token.clone());
-            cache.spawn(move || {
-                let (url, token) = (url.clone(), token.clone());
-                async move {
-                    let remote = Arc::new(RemoteNoteRepo::connect(&url, token.as_deref()).await?);
-                    let probe = remote.clone();
-                    Ok(Connected::new(remote).closed_when(move || probe.is_closed()))
-                }
-            });
-            tracing::info!("using a remote notelet as the store, behind a read cache");
-            (Arc::new(cache.clone()), Some(cache))
+            Arc::new(repo)
         }
         Backend::Remote(r) => {
             tracing::info!("using a remote notelet as the store");
-            (
-                Arc::new(RemoteNoteRepo::connect(&r.url, r.token.as_deref()).await?),
-                None,
-            )
+            Arc::new(RemoteNoteRepo::connect(&r.url, r.token.as_deref()).await?)
         }
     })
 }
 
-/// The explicit end of the read cache: stop its task and write a pending
+/// The store `stdio` runs on: [`open_serving_repo`], except that a remote with
+/// `NOTELET_LOCAL_CACHE=true` is wrapped in the [`local_cache`] instead and
+/// nothing is awaited: the cache connects in the background (or in the first
+/// call that needs the remote), and starts answering at once if it has a
+/// snapshot. The cache is also returned, so that its end can be run (see
+/// [`close_cache`]). `serve` never uses it, and the switch is unused with a
+/// database.
+async fn open_stdio_repo(
+    backend: &Backend,
+) -> anyhow::Result<(Arc<dyn NoteRepo>, Option<LocalCache>)> {
+    let r = match backend {
+        Backend::Remote(r) if r.cache => r,
+        _ => return Ok((open_serving_repo(backend).await?, None)),
+    };
+    let disk = match r.cache_dir.clone() {
+        Some(dir) => match tokio::task::spawn_blocking(move || DiskCache::open(dir)).await? {
+            Ok(disk) => Some(disk),
+            Err(e) => {
+                tracing::warn!(error = %e, "local cache: the cache directory is unusable; keeping the cache in memory only");
+                None
+            }
+        },
+        None => {
+            tracing::warn!("local cache: no cache directory (neither XDG_CACHE_HOME nor HOME is an absolute path); keeping the cache in memory only");
+            None
+        }
+    };
+    let cache = LocalCache::new(disk).await;
+    let (url, token) = (r.url.clone(), r.token.clone());
+    cache.spawn(move || {
+        let (url, token) = (url.clone(), token.clone());
+        async move {
+            let remote = Arc::new(RemoteNoteRepo::connect(&url, token.as_deref()).await?);
+            let probe = remote.clone();
+            Ok(Connected::new(remote).closed_when(move || probe.is_closed()))
+        }
+    });
+    tracing::info!("using a remote notelet as the store, behind a local cache");
+    Ok((Arc::new(cache.clone()), Some(cache)))
+}
+
+/// The explicit end of the local cache: stop its task and write a pending
 /// change to the snapshot (a drop does neither). It runs when `stdio` returns,
-/// that is when stdin reaches EOF. It does not run under `serve`, whose server
-/// has no graceful shutdown, nor when the process is ended by a signal; then
-/// up to one persist interval (30 s) of changes is not written. That loses
-/// nothing that matters: the writes are already on the remote, and the next
-/// start's full relist repairs the snapshot.
-async fn close_cache(cache: Option<CachedRemoteRepo>) {
+/// that is when stdin reaches EOF, and not when the process is ended by a
+/// signal; then up to one persist interval (30 s) of changes is not written.
+/// That loses nothing that matters: the writes are already on the remote, and
+/// the next start's full relist repairs the snapshot.
+async fn close_cache(cache: Option<LocalCache>) {
     if let Some(cache) = cache {
         cache.close().await;
     }
@@ -284,6 +285,39 @@ async fn close_cache(cache: Option<CachedRemoteRepo>) {
 #[cfg(test)]
 mod tests {
     use super::{extra_directives, new_token};
+
+    /// `initialize` must not wait for the remote: with the local cache on,
+    /// `stdio` opens its store without awaiting the connect. Here the
+    /// remote accepts connections and never answers; the plain remote would
+    /// wait for it for 30 s.
+    #[tokio::test]
+    async fn the_local_cache_starts_without_waiting_for_the_remote() {
+        use crate::config::{Backend, RemoteConfig};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let mut conns = Vec::new();
+            while let Ok(c) = listener.accept().await {
+                conns.push(c);
+            }
+        });
+        let backend = Backend::Remote(RemoteConfig {
+            url,
+            token: None,
+            cache: true,
+            cache_dir: None,
+        });
+        let (_repo, cache) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::open_stdio_repo(&backend),
+        )
+        .await
+        .expect("the start waited for the remote")
+        .unwrap();
+        assert!(cache.is_some());
+        held.abort();
+    }
 
     #[test]
     fn tokens_are_prefixed_hex_and_differ() {

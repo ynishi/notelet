@@ -2,9 +2,7 @@
 //! and an adapter. There are three: the Postgres adapter ([`crate::pg`]) and
 //! the in-memory adapter ([`crate::memory`]) in this crate, and the remote
 //! adapter in `notelet-mcp`, which forwards each method to the MCP tool of
-//! another notelet and so lets a process serve with no database; the binary
-//! can put a read cache in front of that one (a wrapper that is itself a
-//! [`NoteRepo`], with a [`crate::memory`] copy behind it). The MCP
+//! another notelet and so lets a process serve with no database. The MCP
 //! binary holds the chosen one as `Arc<dyn NoteRepo>`. An adapter that is not
 //! the store itself may not be able to honour every argument: the remote
 //! one cannot send `by` (the remote records the actor of the token it
