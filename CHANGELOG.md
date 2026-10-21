@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows Keep
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/ynishi/notelet/compare/v0.7.0...v0.8.0) - 2026-10-21
+
+### Added
+
+- cache reads in remote mode behind NOTELET_REMOTE_CACHE
+
+### Fixed
+
+- rename the remote read cache to LocalCache and confine it to stdio
+
 ## [0.7.0](https://github.com/ynishi/notelet/compare/v0.6.0...v0.7.0) - 2026-10-19
 
 ### Added
