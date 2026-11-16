@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `/ui/` | the top-level prefixes (`projects/`, `tasks/`, `lists/` and any other that exists), top-level notes, a search form |
 //! | `/ui/tree/{prefix}` | one page (100) of `list(prefix)`: path, size in bytes, updated_at; the prefixes directly below; `?cursor=` for the next page |
-//! | `/ui/note/{path}` | the note's body rendered from Markdown (see [`crate::render`]), with version, updated_at and size; the whole-note reference `notelet:<path>@v<version>`, and per heading an `id`, a `¶` link and the section reference (below) |
+//! | `/ui/note/{path}` | the note's body, with version, updated_at and size, and the whole-note reference `notelet:<path>@v<version>`. A path whose last segment has no `.`, or whose extension is `md` / `markdown` / `mdx` (ASCII case-insensitive), is rendered from Markdown (see [`crate::render`]) with, per heading, an `id`, a `¶` link and the section reference (below); any other note is shown as code: one `<pre class="code">` with a numbered line per source line (`id="L<n>"`, line numbers drawn by CSS) and no section references |
 //! | `/ui/search?q=&prefix=` | up to three groups, in order. **Prefix match**: note paths whose part after `prefix` starts with `q` (ASCII case-insensitive), each cut to its minimal match (the path up to the end of the segment holding the end of the match, with the trailing `/` when that is not the whole path), so `alc/x.md` and `alc/y.md` give one row `alc/`. **Path match**: paths whose part after `prefix` contains `q` but does not start with it (matching is on the part of the path after `prefix`, which is added back to each row), cut the same way at the first occurrence (`projects/alc/journal.md` gives `projects/alc/`). A cut ending in `/` links to `/ui/tree/`, a whole path to `/ui/note/`; rows are deduplicated and sorted. Both come from a bounded scan of `list(prefix)` that shares [`SCAN_PAGES`] with the prefix scan (the truncation notice is shown when it stops early), and only on the first page: a `cursor` page shows only the third group. **Notes**: `search(q, prefix)` hits (path or body) with snippets and the `next` link. An empty group is not shown; `No match.` appears only when all three are empty. A leading `/` of `prefix` is stripped before any use. An empty `q` with a non-empty `prefix` answers `303 See Other` to `/ui/tree/<prefix>` (an invalid prefix gets the error page); both empty shows only the form |
 //!
 //! Access: when tokens are configured, every `/ui` request needs HTTP Basic
@@ -58,7 +58,7 @@ use notelet_core::{CoreError, NoteService};
 use serde::Deserialize;
 
 use crate::auth::TokenTable;
-use crate::render::{escape, note_markdown, note_ref, query_value};
+use crate::render::{escape, is_markdown_path, note_code, note_markdown, note_ref, query_value};
 
 /// Prefixes always offered on `/ui/`, whether or not anything is under them
 /// yet (the path convention from `notelet_core`).
@@ -272,7 +272,11 @@ async fn note(State(ui): State<Ui>, Path(path): Path<String>) -> Response {
         size = n.body.len(),
         by = escape(&n.updated_by),
         whole = escape(&note_ref(path, n.version)),
-        html = note_markdown(&n.body, path, n.version),
+        html = if is_markdown_path(path) {
+            note_markdown(&n.body, path, n.version)
+        } else {
+            note_code(&n.body, path)
+        },
     );
     page(path, &body)
 }
@@ -513,6 +517,7 @@ a{color:#0b57d0}nav{margin-bottom:.5rem}nav,.meta{color:#666;font-size:.9em}\
 table{border-collapse:collapse;width:100%}td,th{padding:.25rem .5rem;border-bottom:1px solid #ddd;text-align:left}.n{text-align:right}\
 pre{background:#f5f5f5;padding:.5rem;overflow-x:auto;white-space:pre-wrap}code{background:#f5f5f5}.ref{-webkit-user-select:all;user-select:all;font-size:.8rem;font-weight:normal}a.anchor{text-decoration:none;font-size:.8em}\
 article{border-top:1px solid #ddd;padding-top:.5rem}ul.hits{list-style:none;padding:0}form{margin:.5rem 0}\
+pre.code{counter-reset:ln;white-space:pre}pre.code span{counter-increment:ln}pre.code span::before{content:counter(ln);display:inline-block;width:3em;margin-right:1em;text-align:right;color:#888;-webkit-user-select:none;user-select:none}\
 @media (prefers-color-scheme:dark){body{color:#e6e6e6;background:#151515}a{color:#8ab4f8}pre,code{background:#222}td,th,article{border-color:#333}}";
 
 /// Wrap a fragment in a page. `title` is escaped here.
@@ -770,6 +775,22 @@ mod tests {
         assert!(body.contains("&lt;script&gt;alert(1)"), "{body}");
         assert!(body.contains("&lt;script&gt;alert(2)"), "{body}");
         assert!(!body.contains("<script"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn non_markdown_note_is_shown_as_code() {
+        let svc = Arc::new(NoteService::new(Arc::new(MemoryNoteRepo::default())));
+        svc.put("n/s.sh", "# not a heading\necho <b>\n", None, "t")
+            .await
+            .unwrap();
+        let (s, body, _) = call(router(svc, TokenTable::default()), "/ui/note/n/s.sh", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains(r#"<pre class="code">"#), "{body}");
+        assert!(
+            body.contains(r#"<span id="L2">echo &lt;b&gt;</span>"#),
+            "{body}"
+        );
+        assert!(!body.contains("<h1>not a heading"), "{body}");
     }
 
     #[tokio::test]
