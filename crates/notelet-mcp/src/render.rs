@@ -19,6 +19,12 @@
 //!
 //! Links are not resolved against the store: a relative link in a note is
 //! whatever the browser makes of it.
+//!
+//! Only Markdown notes go through the Markdown renderer. [`is_markdown_path`]
+//! decides on the extension of the last path segment (none, `md`,
+//! `markdown` or `mdx`, ASCII case-insensitive, is Markdown); every other note is
+//! source text and [`note_code`] shows it as one `<pre class="code">` with an
+//! `id="L<n>"` per line, escaped, with no section references.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -58,6 +64,57 @@ pub fn markdown(body: &str) -> String {
 /// `section`.
 pub fn note_markdown(body: &str, path: &str, version: i64) -> String {
     render(body, Some((path, version)))
+}
+
+/// What follows the last `.` of the last path segment of `path`, if it has
+/// a `.` (so `a.` gives `""` and `.bashrc` gives `"bashrc"`).
+fn extension(path: &str) -> Option<&str> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.rsplit_once('.').map(|(_, ext)| ext)
+}
+
+/// Whether a note at `path` is shown as Markdown: the last path segment has
+/// no `.`, or its extension is `md`, `markdown` or `mdx` (ASCII
+/// case-insensitive). A dotted name such as `v0.8.0`, `.bashrc` or `a.` is
+/// not Markdown; give it `.md`. Anything else is shown as code by
+/// [`note_code`].
+pub fn is_markdown_path(path: &str) -> bool {
+    match extension(path) {
+        None => true,
+        Some(ext) => ["md", "markdown", "mdx"]
+            .iter()
+            .any(|m| ext.eq_ignore_ascii_case(m)),
+    }
+}
+
+/// Render a non-Markdown body as an HTML fragment:
+/// `<pre class="code"><code class="language-<ext>"><span id="L1">…</span>\n<span id="L2">…</span></code></pre>`.
+///
+/// Lines are `body.lines()`, numbered from 1 as in `note_get` and the
+/// `#L<a>-L<b>` references; each is HTML-escaped and wrapped in a span whose
+/// `id` is `L<n>`, and the spans are joined with `\n`. `<ext>` is the
+/// lowercased extension of the last segment of `path`; the `class` is left
+/// out when there is no extension or it has a character other than ASCII
+/// alphanumerics, `+`, `-` and `_`. The body is never interpreted, so a
+/// Markdown fence inside it stays inside the `<pre>`.
+pub fn note_code(body: &str, path: &str) -> String {
+    let ext = extension(path).map(|e| e.to_ascii_lowercase()).filter(|e| {
+        !e.is_empty()
+            && e.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '_'))
+    });
+    let class = ext
+        .map(|e| format!(r#" class="language-{e}""#))
+        .unwrap_or_default();
+    let lines: Vec<String> = body
+        .lines()
+        .enumerate()
+        .map(|(i, l)| format!(r#"<span id="L{}">{}</span>"#, i + 1, escape(l)))
+        .collect();
+    format!(
+        r#"<pre class="code"><code{class}>{}</code></pre>"#,
+        lines.join("\n")
+    )
 }
 
 /// One heading found in the body.
@@ -351,6 +408,74 @@ mod tests {
         );
         let out = markdown("![alt](data:image/png;base64,AAAA)");
         assert!(!out.contains("<img") && !out.contains("href"), "{out}");
+    }
+
+    #[test]
+    fn code_note_is_escaped_numbered_and_not_markdown() {
+        let out = note_code("# x\n<b>\n__init__\n", "n/a.py");
+        assert!(!out.contains("<h1"), "{out}");
+        assert!(!out.contains("<b>") && !out.contains("<strong"), "{out}");
+        assert!(out.contains("&lt;b&gt;"), "{out}");
+        assert!(out.contains("__init__"), "{out}");
+        assert!(
+            out.contains(r#"id="L1""#) && out.contains(r#"id="L3""#),
+            "{out}"
+        );
+        assert!(!out.contains(r#"id="L4""#), "{out}");
+        assert!(out.contains(r#"class="language-py""#), "{out}");
+        assert!(out.starts_with(r#"<pre class="code">"#), "{out}");
+        assert_eq!(
+            note_code("", "a.py"),
+            r#"<pre class="code"><code class="language-py"></code></pre>"#
+        );
+        assert_eq!(
+            note_code("x", "a.b c"),
+            r#"<pre class="code"><code><span id="L1">x</span></code></pre>"#
+        );
+    }
+
+    #[test]
+    fn code_note_handles_crlf() {
+        let out = note_code("a\r\nb\r\n", "n/a.txt");
+        assert_eq!(out.matches("<span").count(), 2, "{out}");
+        assert!(!out.contains('\r'), "{out}");
+    }
+
+    #[test]
+    fn code_note_keeps_a_fence_inside_one_pre() {
+        let out = note_code("a\n```\nb\n```\n", "n/a.sh");
+        assert_eq!(out.matches("<pre").count(), 1, "{out}");
+        assert_eq!(out.matches("</pre>").count(), 1, "{out}");
+        assert!(out.contains("```"), "{out}");
+    }
+
+    #[test]
+    fn markdown_path_is_decided_by_the_last_segment_extension() {
+        for p in [
+            "n/a.md",
+            "n/a.MD",
+            "n/a.markdown",
+            "n/a.mdx",
+            "n/a.MDX",
+            "n/README",
+            "a.b/c",
+            "n",
+        ] {
+            assert!(is_markdown_path(p), "{p}");
+        }
+        for p in [
+            "n/a.py",
+            "n/a.sh",
+            "n/a.tsv",
+            "n/.bashrc",
+            "n/a.",
+            "n/v0.8.0",
+            "n/a.md.bak",
+            "a.md/x.py",
+        ] {
+            assert!(!is_markdown_path(p), "{p}");
+        }
+        assert!(note_markdown("# H\n", "n/a.md", 1).contains("<h1"));
     }
 
     #[test]
