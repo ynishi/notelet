@@ -1191,14 +1191,14 @@ dependencies = [
 
 [[package]]
 name = "notelet"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "notelet-core",
 ]
 
 [[package]]
 name = "notelet-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "notelet-mcp"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
